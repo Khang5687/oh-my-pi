@@ -11,10 +11,12 @@ import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
+import type { GoalModeState } from "../../goals/state";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
+import type { RpcGoalAction } from "./rpc-goal";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
 	RPC_MESSAGES_PAGE_STALE_ERROR,
@@ -900,6 +902,12 @@ export class RpcClient {
 	 */
 	async setAutoCompaction(enabled: boolean): Promise<void> {
 		await this.#send({ type: "set_auto_compaction", enabled });
+	}
+
+	/** Create, pause, resume, drop, or read the session goal. */
+	async goal(command: RpcGoalAction): Promise<GoalModeState | null> {
+		const response = await this.#send({ type: "goal", ...command });
+		return this.#getData<{ state: GoalModeState | null }>(response).state;
 	}
 
 	/** Set the session-scoped cache warming mode and return the effective mode. */

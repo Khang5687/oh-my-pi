@@ -64,6 +64,7 @@ import { initializeExtensions } from "../runtime-init";
 import { cfgSpellingAutocomplete } from "../settings";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import { RpcGoalController } from "./rpc-goal";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
@@ -1483,6 +1484,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		settleWatcher.observe(event);
 	});
 
+	const goalController = new RpcGoalController(session);
+	goalController.attach();
+	await goalController.restoreFromSession();
+
 	// Discriminates a store failure from any other dispose rejection below.
 	let persistenceFailure: Error | undefined;
 	registerRpcPersistenceSurface(
@@ -1503,6 +1508,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 */
 	const disposeAndExit = async (): Promise<never> => {
 		try {
+			goalController.dispose();
 			await session.dispose();
 		} catch (error) {
 			if (!persistenceFailure || error !== persistenceFailure) throw error;
@@ -1742,6 +1748,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			case "branch": {
 				const result = await handleRpcSessionChange(session, command, subagentRegistry);
 				if (!result.data.cancelled) {
+					await goalController.restoreFromSession();
 					inputGate.commitSessionChange(command);
 					promptResults.abortOpen();
 					// The detached run publishes no terminal agent_end to settle on.
@@ -1754,6 +1761,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			case "open_session": {
 				const result = await openRpcSession(session, command.sessionDir, subagentRegistry);
 				if (!result.cancelled) {
+					await goalController.restoreFromSession();
 					inputGate.commitSessionChange(command);
 					promptResults.abortOpen();
 					void settleWatcher.check();
@@ -1785,6 +1793,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					isSettled: isRpcSessionSettled(session),
 					queuedMessages: { steering: [...queuedMessages.steering], followUp: [...queuedMessages.followUp] },
 					todoPhases: session.getTodoPhases(),
+					goal: session.getGoalModeState(),
 					fastModeEnabled: session.isFastModeEnabled(),
 					tokensPerSecond: calculateTokensPerSecond(session.messages, session.isStreaming),
 					fastModeActive: session.isFastModeActive(),
@@ -2047,6 +2056,15 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			case "set_auto_compaction": {
 				session.setAutoCompactionEnabled(command.enabled);
 				return success(id, "set_auto_compaction");
+			}
+
+			// =================================================================
+			// Goal mode
+			// =================================================================
+
+			case "goal": {
+				const state = await goalController.handle(command);
+				return success(id, "goal", { state: state ?? null });
 			}
 
 			// =================================================================

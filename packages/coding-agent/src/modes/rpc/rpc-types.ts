@@ -9,6 +9,7 @@ import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessageEvent, Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
+import type { GoalModeState } from "../../goals/state";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { FileEntry, SessionEntry, SessionTreeNode } from "../../session/session-entries";
@@ -16,6 +17,7 @@ import type { AvailableSlashCommandSource } from "../../slash-commands/available
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import type { SubagentEventPayload, SubagentLifecyclePayload, SubagentProgressPayload } from "../../task";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
+import type { RpcGoalAction } from "./rpc-goal";
 import type { RpcMessagesPage } from "./rpc-messages";
 
 // ============================================================================
@@ -75,6 +77,9 @@ export type RpcCommand =
 	// Compaction
 	| { id?: string; type: "compact"; customInstructions?: string }
 	| { id?: string; type: "set_auto_compaction"; enabled: boolean }
+
+	// Goal mode
+	| ({ id?: string; type: "goal" } & RpcGoalAction)
 
 	// Cache warming
 	| { id?: string; type: "set_cache_warming"; mode: CacheWarmingMode }
@@ -146,6 +151,8 @@ export interface RpcSessionState {
 	 *  (and the `queue_update` event) instead of tracking chips independently. */
 	queuedMessages: { steering: string[]; followUp: string[] };
 	todoPhases: TodoPhase[];
+	/** Current goal, when goal mode is active or paused. */
+	goal?: GoalModeState;
 	/** For session dump / export (plain-text parity with /dump). */
 	systemPrompt?: string[];
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
@@ -412,6 +419,9 @@ export type RpcResponse =
 	// Compaction
 	| { id?: string; type: "response"; command: "compact"; success: true; data: CompactionResult }
 	| { id?: string; type: "response"; command: "set_auto_compaction"; success: true }
+
+	// Goal mode
+	| { id?: string; type: "response"; command: "goal"; success: true; data: { state: GoalModeState | null } }
 
 	// Cache warming
 	| { id?: string; type: "response"; command: "set_cache_warming"; success: true; data: { mode: CacheWarmingMode } }
