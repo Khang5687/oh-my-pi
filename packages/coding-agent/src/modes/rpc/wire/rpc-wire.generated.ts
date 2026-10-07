@@ -1595,6 +1595,10 @@ export interface GetAvailableCommandsResult {
 	commands: AvailableSlashCommand[];
 }
 
+export interface RefreshCommandsResult {
+	commands: AvailableSlashCommand[];
+}
+
 export interface GetEntriesParams {
 	since?: string;
 }
@@ -1887,6 +1891,7 @@ export interface RpcWireCommands {
 	goal: { params: GoalParams; result: GoalResult };
 	set_ask_dialog: { params: SetAskDialogParams; result: SetAskDialogResult };
 	get_available_commands: { params: undefined; result: GetAvailableCommandsResult };
+	refresh_commands: { params: undefined; result: RefreshCommandsResult };
 	get_entries: { params: GetEntriesParams; result: SessionEntries };
 	get_tree: { params: undefined; result: SessionTree };
 	set_todos: { params: SetTodosParams; result: SetTodosResult };

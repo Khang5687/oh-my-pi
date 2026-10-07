@@ -1282,6 +1282,13 @@
 - Corrected tool behavior and configuration documentation for `read`, background `bash`, Python evaluation, replace editing, goal removal, and `advisor.immuneTurns`.
 - Fixed custom glob backends from hanging indefinitely; scans now respect the tool deadline and report incomplete results when necessary.
 - Fixed `--resume <path>` from silently creating a new session for a missing path; it now reports the missing path, consistent with `--fork <path>` and `--resume <id>`.
+### Added
+
+- Added the RPC `refresh_commands` command so hosts can pick up skills and slash commands installed while a session is running; `/skill:<name>` for a newly installed skill works right away, and the system prompt (and its provider cache) stays untouched unless the listed skills changed.
+
+### Changed
+
+- RPC no longer pushes an `available_commands_update` frame when a skill or command rediscovery leaves the slash-command catalog unchanged.
 
 ## [18.8.0] - 2026-10-07
 
