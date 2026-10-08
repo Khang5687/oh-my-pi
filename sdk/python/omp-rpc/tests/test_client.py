@@ -1158,7 +1158,11 @@ class RpcClientTests(unittest.TestCase):
                 request.id,
                 [
                     AskAnswer(id=questions[0].id, selected_options=(), custom_input="DuckDB"),
-                    AskAnswer(id=questions[1].id, selected_options=("Auth", "Search")),
+                    AskAnswer(
+                        id=questions[1].id,
+                        selected_options=("Auth", "Search"),
+                        note="Search can wait",
+                    ),
                 ],
             )
             client.wait_for_idle(timeout=2.0)
@@ -1169,7 +1173,11 @@ class RpcClientTests(unittest.TestCase):
                     "id": "ui-ask",
                     "answers": [
                         {"id": "db", "selectedOptions": [], "customInput": "DuckDB"},
-                        {"id": "features", "selectedOptions": ["Auth", "Search"]},
+                        {
+                            "id": "features",
+                            "selectedOptions": ["Auth", "Search"],
+                            "note": "Search can wait",
+                        },
                     ],
                 },
             )

@@ -943,6 +943,8 @@ class RpcClient(WireClient):
             }
             if answer.custom_input is not None:
                 entry["customInput"] = answer.custom_input
+            if answer.note is not None:
+                entry["note"] = answer.note
             wire_answers.append(entry)
         self._send_notification(
             {"type": "extension_ui_response", "id": request_id, "answers": wire_answers}

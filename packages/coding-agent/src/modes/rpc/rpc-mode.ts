@@ -1083,7 +1083,7 @@ function parseAskDialogResponse(
 			}
 			const labels = question.options.map(option => option.label);
 			const multi = question.multi ?? false;
-			const { selectedOptions, customInput } = answer;
+			const { selectedOptions, customInput, note } = answer;
 			if (!Array.isArray(selectedOptions)) {
 				throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} must carry a selectedOptions array`);
 			}
@@ -1110,6 +1110,9 @@ function parseAskDialogResponse(
 					`Ask dialog answer ${JSON.stringify(question.id)} is single-select but carries more than one answer`,
 				);
 			}
+			if (note !== undefined && typeof note !== "string") {
+				throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} note must be a string`);
+			}
 			return {
 				id: question.id,
 				question: question.question,
@@ -1117,6 +1120,7 @@ function parseAskDialogResponse(
 				multi,
 				selectedOptions: selected,
 				customInput: custom,
+				note: note?.trim() || undefined,
 			};
 		}),
 	};
@@ -2093,7 +2097,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 			case "set_ask_dialog": {
 				rpcUiContext.askDialogEnabled = command.enabled === true;
-				return success(id, "set_ask_dialog", { enabled: rpcUiContext.askDialogEnabled });
+				// `notes` tells hosts this build reads `note` from `ask` answers.
+				return success(id, "set_ask_dialog", { enabled: rpcUiContext.askDialogEnabled, notes: true });
 			}
 
 			case "get_available_commands": {

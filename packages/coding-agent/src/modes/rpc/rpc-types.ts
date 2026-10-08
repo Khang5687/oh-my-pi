@@ -411,7 +411,13 @@ export type RpcResponse =
 	  }
 	| { id?: string; type: "response"; command: "set_slow_mode"; success: true; data: { enabled: boolean } }
 	| { id?: string; type: "response"; command: "goal"; success: true; data: RpcGoalResult }
-	| { id?: string; type: "response"; command: "set_ask_dialog"; success: true; data: { enabled: boolean } }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_ask_dialog";
+			success: true;
+			data: { enabled: boolean; notes: boolean };
+	  }
 	| {
 			id?: string;
 			type: "response";
@@ -878,7 +884,7 @@ export type RpcExtensionUIResponse =
 	| {
 			type: "extension_ui_response";
 			id: string;
-			answers: Array<{ id: string; selectedOptions: string[]; customInput?: string }>;
+			answers: Array<{ id: string; selectedOptions: string[]; customInput?: string; note?: string }>;
 	  };
 
 // ============================================================================

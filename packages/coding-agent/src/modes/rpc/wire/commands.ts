@@ -108,7 +108,10 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		name: "set_ask_dialog",
 		doc: "Opt in to `ask` UI requests; returns the applied setting.",
 		params: { enabled: "boolean" },
-		result: { enabled: "boolean" },
+		result: {
+			enabled: "boolean",
+			"notes?": doc("boolean", "True when this build reads `note` from `ask` answers; absent on older builds."),
+		},
 		unwrap: "enabled",
 	},
 	{

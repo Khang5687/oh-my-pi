@@ -4521,7 +4521,7 @@ impl<'de> Deserialize<'de> for ExtensionUiRequest {
 	}
 }
 
-/// Answer to one `ask` question: exact option labels, plus optional free text.
+/// Answer to one `ask` question: exact option labels, plus optional free text and note.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AskAnswer {
 	pub id: String,
@@ -4529,6 +4529,9 @@ pub struct AskAnswer {
 	pub selected_options: Vec<String>,
 	#[serde(rename = "customInput", default, skip_serializing_if = "Option::is_none")]
 	pub custom_input: Option<String>,
+	/// Comment on the answer; the model receives it alongside that answer.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub note: Option<String>,
 }
 
 /// Answers a `select`, `input`, or `editor` request.
@@ -5120,6 +5123,9 @@ pub struct SetAskDialogParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetAskDialogResult {
 	pub enabled: bool,
+	/// True when this build reads `note` from `ask` answers; absent on older builds.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub notes: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

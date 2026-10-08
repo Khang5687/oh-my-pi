@@ -441,7 +441,7 @@ elif request.method in {"input", "editor"}:
 After `client.set_ask_dialog(True)`, the agent's `ask` tool sends one `ask`
 request carrying every question (`request.questions`) instead of one `select`
 per question. Answer with one `AskAnswer` per question, in order; hosts always
-offer free text, sent as `custom_input`:
+offer free text, sent as `custom_input`, and may attach a comment as `note`:
 
 ```python
 from omp_rpc import AskAnswer

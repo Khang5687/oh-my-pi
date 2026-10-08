@@ -217,8 +217,13 @@ export const frameDefs = {
 		"Extension UI request, discriminated by `method`.",
 	),
 	AskAnswer: doc(
-		{ id: "string", selectedOptions: "string[]", "customInput?": "string" },
-		"Answer to one `ask` question: exact option labels, plus optional free text.",
+		{
+			id: "string",
+			selectedOptions: "string[]",
+			"customInput?": "string",
+			"note?": doc("string", "Comment on the answer; the model receives it alongside that answer."),
+		},
+		"Answer to one `ask` question: exact option labels, plus optional free text and note.",
 	),
 	ValueUiResponse: doc(
 		{ type: "'extension_ui_response'", id: "string", value: "string" },

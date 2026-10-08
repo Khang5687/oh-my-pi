@@ -454,8 +454,8 @@ describe("RPC ask dialog", () => {
 
 		respond(pendingRequests, request.id, {
 			answers: [
-				{ id: "db", selectedOptions: ["Postgres"], customInput: "   " },
-				{ id: "features", selectedOptions: ["Search", "Auth"], customInput: "  Export  " },
+				{ id: "db", selectedOptions: ["Postgres"], customInput: "   ", note: "  " },
+				{ id: "features", selectedOptions: ["Search", "Auth"], customInput: "  Export  ", note: " Auth first " },
 			],
 		});
 		expect(await result).toEqual({
@@ -476,6 +476,7 @@ describe("RPC ask dialog", () => {
 					multi: true,
 					selectedOptions: ["Search", "Auth"],
 					customInput: "Export",
+					note: "Auth first",
 				},
 			],
 		});
@@ -493,6 +494,7 @@ describe("RPC ask dialog", () => {
 			"an option plus custom input on a single-select",
 			[{ id: "db", selectedOptions: ["Postgres"], customInput: "DuckDB" }, validFeatures],
 		],
+		["a non-string note", [validDb, { id: "features", selectedOptions: ["Auth"], note: 42 }]],
 	])("rejects %s", async (_case, answers) => {
 		const pendingRequests = new Map<string, PendingExtensionRequest>();
 		const output = vi.fn<(frame: object) => void>();
@@ -626,7 +628,7 @@ describe("RPC ask dialog", () => {
 						id: frame.id,
 						answers: [
 							{ id: "db", selectedOptions: [], customInput: "DuckDB" },
-							{ id: "features", selectedOptions: ["Auth", "Search"] },
+							{ id: "features", selectedOptions: ["Auth", "Search"], note: "Search can wait" },
 						],
 					});
 				} else if (frame.type === "tool_execution_end" && frame.toolName === "ask") {
@@ -660,7 +662,7 @@ describe("RPC ask dialog", () => {
 			type: "response",
 			command: "set_ask_dialog",
 			success: true,
-			data: { enabled: true },
+			data: { enabled: true, notes: true },
 		});
 		expect(askRequests).toEqual([
 			{
@@ -676,7 +678,11 @@ describe("RPC ask dialog", () => {
 				details: {
 					results: [
 						expect.objectContaining({ id: "db", selectedOptions: [], customInput: "DuckDB" }),
-						expect.objectContaining({ id: "features", selectedOptions: ["Auth", "Search"] }),
+						expect.objectContaining({
+							id: "features",
+							selectedOptions: ["Auth", "Search"],
+							note: "Search can wait",
+						}),
 					],
 				},
 			}),

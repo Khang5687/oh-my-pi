@@ -5784,11 +5784,13 @@ func (v *ExtensionUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
-// Answer to one `ask` question: exact option labels, plus optional free text.
+// Answer to one `ask` question: exact option labels, plus optional free text and note.
 type AskAnswer struct {
 	ID              string   `json:"id"`
 	SelectedOptions []string `json:"selectedOptions"`
 	CustomInput     *string  `json:"customInput,omitempty"`
+	// Comment on the answer; the model receives it alongside that answer.
+	Note *string `json:"note,omitempty"`
 }
 
 func (v *AskAnswer) UnmarshalJSON(data []byte) error {
@@ -5801,6 +5803,7 @@ func (v *AskAnswer) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("id", &out.ID)
 	d.required("selectedOptions", &out.SelectedOptions)
 	d.optional("customInput", &out.CustomInput)
+	d.optional("note", &out.Note)
 	if d.err != nil {
 		return d.err
 	}
@@ -6837,6 +6840,8 @@ func (v *SetSlowModeResult) decodeFrom(raw map[string]json.RawMessage) error {
 
 type SetAskDialogResult struct {
 	Enabled bool `json:"enabled"`
+	// True when this build reads `note` from `ask` answers; absent on older builds.
+	Notes *bool `json:"notes,omitempty"`
 }
 
 func (v *SetAskDialogResult) UnmarshalJSON(data []byte) error {
@@ -6847,6 +6852,7 @@ func (v *SetAskDialogResult) decodeFrom(raw map[string]json.RawMessage) error {
 	var out SetAskDialogResult
 	d := fieldDecoder{raw: raw, owner: "SetAskDialogResult"}
 	d.required("enabled", &out.Enabled)
+	d.optional("notes", &out.Notes)
 	if d.err != nil {
 		return d.err
 	}

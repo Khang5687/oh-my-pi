@@ -5233,13 +5233,17 @@
 				},
 				"customInput": {
 					"type": "string"
+				},
+				"note": {
+					"type": "string",
+					"description": "Comment on the answer; the model receives it alongside that answer."
 				}
 			},
 			"required": [
 				"id",
 				"selectedOptions"
 			],
-			"description": "Answer to one `ask` question: exact option labels, plus optional free text."
+			"description": "Answer to one `ask` question: exact option labels, plus optional free text and note."
 		},
 		"ValueUiResponse": {
 			"type": "object",
@@ -5980,6 +5984,10 @@
 			"properties": {
 				"enabled": {
 					"type": "boolean"
+				},
+				"notes": {
+					"type": "boolean",
+					"description": "True when this build reads `note` from `ask` answers; absent on older builds."
 				}
 			},
 			"required": [

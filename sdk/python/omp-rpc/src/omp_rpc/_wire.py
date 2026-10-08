@@ -1543,10 +1543,12 @@ class ExtensionUiRequest(ExtensionUiRequestMixin):
 
 @dataclass(slots=True, frozen=True, kw_only=True)
 class AskAnswer:
-    """Answer to one `ask` question: exact option labels, plus optional free text."""
+    """Answer to one `ask` question: exact option labels, plus optional free text and note."""
     id: str
     selected_options: tuple[str, ...]
     custom_input: str | None = None
+    note: str | None = None
+    """Comment on the answer; the model receives it alongside that answer."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2948,6 +2950,7 @@ def parse_ask_answer(value: object, path: str = "AskAnswer") -> AskAnswer:
         id=required(payload, "id", decode_str, path),
         selected_options=required(payload, "selectedOptions", array(decode_str), path),
         custom_input=optional(payload, "customInput", decode_str, path),
+        note=optional(payload, "note", decode_str, path),
     )
 
 

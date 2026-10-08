@@ -684,7 +684,8 @@ The corresponding `get_state` result reports the same computed state:
 for every process; until a host enables it, the `ask` tool keeps prompting with
 one `select` (plus `editor` for free text) per choice. Builds without the
 command answer with a failed `response`, so hosts should keep the `select`
-fallback when enabling fails.
+fallback when enabling fails. `notes: true` in the result means the build reads
+`note` from `ask` answers; builds without it ignore notes.
 
 ```json
 { "id": "req_ask", "type": "set_ask_dialog", "enabled": true }
@@ -696,7 +697,7 @@ fallback when enabling fails.
   "type": "response",
   "command": "set_ask_dialog",
   "success": true,
-  "data": { "enabled": true }
+  "data": { "enabled": true, "notes": true }
 }
 ```
 
@@ -1255,7 +1256,7 @@ Example:
 - `{ type: "extension_ui_response", id: string, value: string }`
 - `{ type: "extension_ui_response", id: string, confirmed: boolean }`
 - `{ type: "extension_ui_response", id: string, cancelled: true, timedOut?: boolean }`
-- `{ type: "extension_ui_response", id: string, answers: Array<{ id: string, selectedOptions: string[], customInput?: string }> }` (answers an `ask` request)
+- `{ type: "extension_ui_response", id: string, answers: Array<{ id: string, selectedOptions: string[], customInput?: string, note?: string }> }` (answers an `ask` request)
 
 `select` and `input` resolve to `undefined`, and `confirm` to `false`, on
 cancellation, timeout, or signal abort. Signal abort emits a `cancel` request
@@ -1270,7 +1271,8 @@ option, else its first.
 `answers` must list one entry per question in request order, with each `id` equal to that question's `id`.
 `selectedOptions` holds exact option labels without duplicates; a multi-select may be empty. A single-select
 (`multi` absent or false) takes at most one option and not both an option and `customInput`. `customInput`
-is trimmed and ignored when empty. Any other shape fails the `ask` tool call instead of guessing.
+is trimmed and ignored when empty. `note` is a comment on the answer, trimmed and ignored when empty; the
+model receives it alongside that answer. Any other shape fails the `ask` tool call instead of guessing.
 
 ```json
 {
@@ -1290,7 +1292,7 @@ is trimmed and ignored when empty. Any other shape fails the `ask` tool call ins
   "id": "ui_9",
   "answers": [
     { "id": "db", "selectedOptions": [], "customInput": "DuckDB" },
-    { "id": "features", "selectedOptions": ["Auth", "Search"] }
+    { "id": "features", "selectedOptions": ["Auth", "Search"], "note": "Search can wait for v2" }
   ]
 }
 ```

@@ -1292,11 +1292,13 @@ export interface OpenUrlUiRequest {
 /** Extension UI request, discriminated by `method`. */
 export type ExtensionUiRequest = SelectUiRequest | ConfirmUiRequest | InputUiRequest | EditorUiRequest | AskUiRequest | CancelUiRequest | NotifyUiRequest | SetStatusUiRequest | SetWidgetUiRequest | SetTitleUiRequest | SetEditorTextUiRequest | OpenUrlUiRequest;
 
-/** Answer to one `ask` question: exact option labels, plus optional free text. */
+/** Answer to one `ask` question: exact option labels, plus optional free text and note. */
 export interface AskAnswer {
 	id: string;
 	selectedOptions: string[];
 	customInput?: string;
+	/** Comment on the answer; the model receives it alongside that answer. */
+	note?: string;
 }
 
 /** Answers a `select`, `input`, or `editor` request. */
@@ -1521,6 +1523,8 @@ export interface SetAskDialogParams {
 
 export interface SetAskDialogResult {
 	enabled: boolean;
+	/** True when this build reads `note` from `ask` answers; absent on older builds. */
+	notes?: boolean;
 }
 
 export interface GetAvailableCommandsResult {

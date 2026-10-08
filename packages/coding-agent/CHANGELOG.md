@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added notes to the RPC ask dialog: hosts can send a `note` with each `ask` answer and the model receives it the way it receives a note typed in the terminal dialog; `set_ask_dialog` reports `notes: true` on builds that accept them
+
 ## [18.8.4] - 2026-10-08
 
 ### Changed
