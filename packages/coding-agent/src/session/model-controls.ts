@@ -17,7 +17,7 @@ import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
 import { classifyDifficulty } from "../auto-thinking/classifier";
-import type { ModelRegistry } from "../config/model-registry";
+import { isModelAuthAvailable, type ModelRegistry } from "../config/model-registry";
 import {
 	filterAvailableModelsByEnabledPatterns,
 	formatModelStringWithRouting,
@@ -409,20 +409,21 @@ export class ModelControls {
 	}
 
 	async #getScopedModelsWithApiKey(): Promise<Array<{ model: Model; thinkingLevel?: ThinkingLevel }>> {
-		const apiKeysByProvider = new Map<string, string | undefined>();
+		const availableByProvider = new Map<string, boolean>();
 		const result: Array<{ model: Model; thinkingLevel?: ThinkingLevel }> = [];
 
 		for (const scoped of this.scopedModels) {
 			const provider = scoped.model.provider;
-			let apiKey: string | undefined;
-			if (apiKeysByProvider.has(provider)) {
-				apiKey = apiKeysByProvider.get(provider);
+			let available: boolean;
+			const cached = availableByProvider.get(provider);
+			if (cached !== undefined) {
+				available = cached;
 			} else {
-				apiKey = await this.#host.modelRegistry.getApiKeyForProvider(provider, this.#host.sessionId());
-				apiKeysByProvider.set(provider, apiKey);
+				available = await this.#host.modelRegistry.isProviderAuthAvailable(provider, this.#host.sessionId());
+				availableByProvider.set(provider, available);
 			}
 
-			if (apiKey) {
+			if (available) {
 				result.push(scoped);
 			}
 		}
@@ -470,8 +471,7 @@ export class ModelControls {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const nextModel = availableModels[nextIndex];
 
-		const apiKey = await this.#host.modelRegistry.getApiKey(nextModel, this.#host.sessionId());
-		if (!apiKey) {
+		if (!(await isModelAuthAvailable(this.#host.modelRegistry, nextModel, this.#host.sessionId()))) {
 			throw new Error(`No API key for ${nextModel.provider}/${nextModel.id}`);
 		}
 

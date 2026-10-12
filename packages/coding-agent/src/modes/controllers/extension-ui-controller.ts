@@ -2,6 +2,7 @@ import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
 import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
 import type { CollabHost } from "../../collab/host";
+import { isModelAuthAvailable } from "../../config/model-registry";
 import { formatKeyHint, formatKeyHints, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type {
 	CompactOptions,
@@ -214,8 +215,7 @@ export class ExtensionUiController {
 			getAllTools: () => this.ctx.session.getAllToolInfos(),
 			setActiveTools: toolNames => this.ctx.session.setActiveToolsByName(toolNames),
 			setModel: async model => {
-				const key = await this.ctx.session.modelRegistry.getApiKey(model);
-				if (!key) return false;
+				if (!(await isModelAuthAvailable(this.ctx.session.modelRegistry, model))) return false;
 				await this.ctx.session.setModel(model);
 				return true;
 			},
@@ -442,8 +442,7 @@ export class ExtensionUiController {
 			getAllTools: () => this.ctx.session.getAllToolInfos(),
 			setActiveTools: toolNames => this.ctx.session.setActiveToolsByName(toolNames),
 			setModel: async model => {
-				const key = await this.ctx.session.modelRegistry.getApiKey(model);
-				if (!key) return false;
+				if (!(await isModelAuthAvailable(this.ctx.session.modelRegistry, model))) return false;
 				await this.ctx.session.setModel(model);
 				return true;
 			},

@@ -46,7 +46,7 @@ import {
 	parseConfiguredThinkingLevel,
 	resolveThinkingLevelForModel,
 } from "@oh-my-pi/pi-tui/thinking";
-import { isAuthenticated, kNoAuth, type ModelRegistry } from "./model-registry";
+import { type ModelRegistry, probeModelAuth } from "./model-registry";
 import {
 	DEFAULT_MODEL_ROLE_ALIAS,
 	formatModelRoleAlias,
@@ -1742,8 +1742,7 @@ export async function resolveModelOverrideWithAuthFallback(
 		return { ...primary, authFallbackUsed: false };
 	}
 
-	const primaryKey = await modelRegistry.getApiKey(primary.model, sessionId);
-	if (primaryKey === kNoAuth || isAuthenticated(primaryKey)) {
+	if ((await probeModelAuth(modelRegistry, primary.model, sessionId)).available) {
 		return { ...primary, authFallbackUsed: false };
 	}
 
@@ -1754,8 +1753,7 @@ export async function resolveModelOverrideWithAuthFallback(
 	if (modelsAreEqual(fallback.model, primary.model)) {
 		return { ...primary, authFallbackUsed: false };
 	}
-	const fallbackKey = await modelRegistry.getApiKey(fallback.model, sessionId);
-	if (!isAuthenticated(fallbackKey)) {
+	if (!(await probeModelAuth(modelRegistry, fallback.model, sessionId)).authenticated) {
 		return { ...primary, authFallbackUsed: false };
 	}
 
@@ -2423,7 +2421,7 @@ export async function restoreModelFromSession(
 	const restoredModel = modelRegistry.find(savedProvider, savedModelId);
 
 	// Check if restored model exists and has a valid API key
-	const hasApiKey = restoredModel ? !!(await modelRegistry.getApiKey(restoredModel)) : false;
+	const hasApiKey = restoredModel ? (await probeModelAuth(modelRegistry, restoredModel)).available : false;
 
 	if (restoredModel && hasApiKey) {
 		if (shouldPrintMessages) {
