@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { managedFailureOutcome } from "@oh-my-pi/pi-ai/auth-retry";
 import { isProviderRetryableError } from "@oh-my-pi/pi-ai/error";
 
 describe("isProviderRetryableError", () => {
@@ -97,5 +98,70 @@ describe("isProviderRetryableError", () => {
 			const err = Object.assign(new Error(`400 ${JSON.stringify(body)}`), { status: 400, code, error: body });
 			expect(isProviderRetryableError(err)).toBe(false);
 		}
+	});
+});
+
+describe("managed attempt outcome vocabulary", () => {
+	const NOW = 1_800_000_000_000;
+	const future = String(Math.floor((NOW + 3_600_000) / 1000));
+	const past = String(Math.floor((NOW - 60_000) / 1000));
+	const input = { startedAt: NOW - 10, finishedAt: NOW, replayUnsafe: false };
+	const rejection = (status: number, headers: Record<string, string> = {}) =>
+		Object.assign(new Error(`${status} rejected`), { status, headers });
+
+	it("positive exhaustion needs unified utilization>=1 with a future reset", () => {
+		const outcome = managedFailureOutcome(
+			rejection(429, {
+				"anthropic-ratelimit-unified-5h-utilization": "1",
+				"anthropic-ratelimit-unified-5h-reset": future,
+			}),
+			input,
+		);
+		expect(outcome.code).toBe("quota_exhausted");
+		expect(outcome.quotaBlocks).toHaveLength(1);
+		expect(outcome.quotaBlocks[0]).toMatchObject({ confirmed: true, resetAt: Number(future) * 1000 });
+	});
+
+	it("preserves Retry-After independently of any reset", () => {
+		const outcome = managedFailureOutcome(rejection(429, { "retry-after": "7" }), input);
+		expect(outcome.code).toBe("rate_limited");
+		expect(outcome.retryAfterMs).toBe(7000);
+		expect(outcome.quotaBlocks).toEqual([]);
+	});
+
+	it("bare 429, body-only text, utilization<1, missing or past reset, malformed headers never establish quota", () => {
+		const bodyOnly = Object.assign(new Error("429 You have exhausted your usage limit"), { status: 429 });
+		const cases = [
+			rejection(429),
+			bodyOnly,
+			rejection(429, {
+				"anthropic-ratelimit-unified-5h-utilization": "0.99",
+				"anthropic-ratelimit-unified-5h-reset": future,
+			}),
+			rejection(429, { "anthropic-ratelimit-unified-5h-utilization": "1" }),
+			rejection(429, {
+				"anthropic-ratelimit-unified-5h-utilization": "1",
+				"anthropic-ratelimit-unified-5h-reset": past,
+			}),
+			rejection(429, {
+				"anthropic-ratelimit-unified-5h-utilization": "banana",
+				"anthropic-ratelimit-unified-5h-reset": future,
+			}),
+		];
+		for (const error of cases) {
+			const outcome = managedFailureOutcome(error, input);
+			expect(outcome.code).toBe("rate_limited");
+			expect(outcome.quotaBlocks).toEqual([]);
+		}
+	});
+
+	it("maps auth, provider, network and abort failures without carrying error text", () => {
+		expect(managedFailureOutcome(rejection(401), input).code).toBe("auth_failed");
+		expect(managedFailureOutcome(rejection(529), input).code).toBe("provider_failed");
+		expect(managedFailureOutcome(new Error("socket closed"), input).code).toBe("network_failed");
+		expect(managedFailureOutcome(new Error("x"), { ...input, aborted: true }).code).toBe("cancelled");
+		const unsafe = managedFailureOutcome(rejection(529), { ...input, replayUnsafe: true });
+		expect(unsafe).toMatchObject({ dispatch: "replay_unsafe", replaySafe: false });
+		expect(JSON.stringify(managedFailureOutcome(rejection(401), input))).not.toContain("rejected");
 	});
 });

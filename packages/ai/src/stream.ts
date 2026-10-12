@@ -16,8 +16,19 @@ import {
 import { CODEX_BASE_URL } from "@oh-my-pi/pi-catalog/wire/codex";
 import { $env, getProviderInFlightRoot, isEnoent, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
-import { createAuthRetryKeyState, isApiKeyResolver, resolvedApiKeyBearer, resolveNextAuthRetryKey } from "./auth-retry";
-import type { OAuthRequestIdentity } from "./auth/types";
+import {
+	type ApiKeyResolver,
+	beginManagedCall,
+	createAuthRetryKeyState,
+	isApiKeyResolver,
+	ManagedAttemptSource,
+	managedAdmissionOf,
+	ManagedDispatchRefusedError,
+	resolvedApiKeyBearer,
+	resolveNextAuthRetryKey,
+} from "./auth-retry";
+import type { ManagedAttemptOutcome, OAuthRequestIdentity } from "./auth/types";
+import type { ManagedResolvedApiKey } from "./auth-retry";
 import { getEnvApiKey } from "./env-api-key";
 import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
@@ -1274,6 +1285,78 @@ function forwardBedrockUserAgent(
 	return modelUserAgent === undefined ? callerHeaders : { ...callerHeaders, "User-Agent": modelUserAgent };
 }
 
+/**
+ * Host-managed Claude routing. The host grants one row per HTTP attempt, so this path has no sibling
+ * rotation, key fallback or buffered auth replay: the provider re-admits through `managedAttempts`
+ * before every request (auth, body-repair and empty-completion retries included) and a refusal or
+ * terminal failure surfaces as-is.
+ */
+function streamManagedRequest<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	requestOptions: SimpleStreamOptions,
+	resolver: ApiKeyResolver,
+): AssistantMessageEventStream {
+	const outer = new AssistantMessageEventStream();
+	const signal = requestOptions.signal;
+	void (async () => {
+		let source: ManagedAttemptSource | undefined;
+		try {
+			if (model.api !== "anthropic-messages") {
+				throw new ManagedDispatchRefusedError("unsupported_transport");
+			}
+			const call =
+				resolver.seededManagedCall ??
+				beginManagedCall(resolver, {
+					sessionId: requestOptions.sessionId,
+					modelId: model.id,
+					purpose: "agent_turn",
+					signal,
+					replayPolicy: "no_replay",
+				});
+			if (!call) throw new AIError.ConfigurationError("Managed routing requires a call context");
+			const readmit = async (previousOutcome: ManagedAttemptOutcome | undefined, attemptSignal?: AbortSignal) =>
+				resolver({
+					lastChance: false,
+					error: undefined,
+					signal: attemptSignal ?? signal,
+					managedCall: call,
+					previousOutcome,
+				});
+			const first = await readmit(undefined, signal);
+			const binding = managedAdmissionOf(first);
+			const bearer = resolvedApiKeyBearer(first);
+			if (!binding || bearer === undefined || typeof first !== "object") {
+				throw new AIError.MissingApiKeyError(model.provider);
+			}
+			source = new ManagedAttemptSource(call, first as ManagedResolvedApiKey, readmit);
+			const inner = streamSimpleRequest(model, context, {
+				...requestOptions,
+				apiKey: bearer,
+				credentialId: first.credentialId,
+				oauthIdentity: first.oauthIdentity,
+				managedAttempts: source,
+			});
+			for await (const event of inner) {
+				if (first.credentialId !== undefined) {
+					if ("partial" in event) event.partial.credentialId = first.credentialId;
+					else if (event.type === "done") event.message.credentialId = first.credentialId;
+					else event.error.credentialId = first.credentialId;
+				}
+				outer.push(event);
+				if (outer.done) break;
+			}
+			if (!outer.done) outer.end(await inner.result());
+		} catch (error) {
+			outer.fail(error);
+		} finally {
+			// Last line of defence for exactly-one outcome (consumer break, abort, thrown provider).
+			source?.settleOpen(undefined, { replayUnsafe: false, aborted: signal?.aborted === true });
+		}
+	})();
+	return outer;
+}
+
 function streamSimpleRequest<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
@@ -1285,6 +1368,7 @@ function streamSimpleRequest<TApi extends Api>(
 	);
 
 	const apiKeyResolver = isApiKeyResolver(requestOptions?.apiKey) ? requestOptions.apiKey : undefined;
+	if (apiKeyResolver?.managedRouting) return streamManagedRequest(model, context, requestOptions, apiKeyResolver);
 	if (apiKeyResolver) {
 		const outer = new AssistantMessageEventStream();
 		const signal = requestOptions?.signal;
@@ -1830,6 +1914,8 @@ function mapOptionsForApi<TApi extends Api>(
 		apiKey: apiKey ?? (typeof options?.apiKey === "string" ? options.apiKey : undefined),
 		credentialId: options?.credentialId,
 		oauthIdentity: options?.oauthIdentity,
+		managedAttempts: options?.managedAttempts,
+		providerRetryWait: options?.providerRetryWait,
 		cacheRetention: options?.cacheRetention,
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,

@@ -10,6 +10,8 @@
 
 - Added `AuthStorage.usage.refreshRoutingObservation()`, an admission-only exact-row billing read (local or through the optional `exact-usage-v1` auth-broker capability and `POST /v1/usage/exact`) that never lists sibling accounts or falls back to aggregate usage
 
+- Added `AuthStorage.routing` strict exact-row resolution (`resolveExact`, `refreshMetadata`, `rankCandidates`) and per-HTTP-attempt managed admission (`ManagedRoutingDriver`, `ManagedAdmissionBinding`, `ManagedAttemptOutcome`) carried through the agent loop, streaming and `withAuth` paths; OAuth request identity now carries the serving `accountId`
+
 ### Changed
 
 - Bumped the Claude usage cache version so reports cached before the routing observation existed are re-fetched

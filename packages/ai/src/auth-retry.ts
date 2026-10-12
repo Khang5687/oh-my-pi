@@ -1,9 +1,24 @@
 import { extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
-import type { LimitsApi, OAuthAccess, OAuthApi, OAuthRequestIdentity } from "./auth/types";
+import type {
+	LimitsApi,
+	ManagedAdmissionBinding,
+	ManagedAttemptOutcome,
+	ManagedCallContext,
+	ManagedReplayPolicy,
+	ManagedRoutingDriver,
+	OAuthAccess,
+	OAuthApi,
+	OAuthRequestIdentity,
+	RoutingRefusalCode,
+} from "./auth/types";
 import * as AIError from "./error";
 import { isAuthRetryableError, isInvalidatedOAuthTokenError } from "./error/auth-classify";
 import { isAccountPolicyError, isUsageLimit } from "./error/flags";
 import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-limit";
+import { type HeadersLike, getHeadersFromError, getRetryAfterMsFromHeaders } from "./utils/retry-after";
+import { parseClaudeRateLimitHeaders } from "./usage/claude";
+import { type RoutingWindow, readRoutingObservation } from "./usage";
+import type { RoutingQuotaBlock } from "./auth/rank";
 
 /**
  * Context passed to an {@link ApiKeyResolver} on each resolution attempt.
@@ -32,6 +47,10 @@ export interface ApiKeyResolveContext {
 	previousKey?: string;
 	/** Caller cancel signal, threaded into any credential refresh / rotation work. */
 	signal?: AbortSignal;
+	/** The logical model call this resolution belongs to, when the resolver is managed. */
+	managedCall?: ManagedCallContext;
+	/** Outcome of the managed attempt that just ended, so the host can re-admit from evidence. */
+	previousOutcome?: ManagedAttemptOutcome;
 }
 
 /**
@@ -50,11 +69,94 @@ export interface ResolvedApiKey {
 	afterSiblingWait?: boolean;
 	/** Non-secret request scope belonging to this bearer, replaced on account rotation. */
 	oauthIdentity?: OAuthRequestIdentity;
+	/** Present only for host-managed routing: the admission this bearer was granted under. */
+	managedAdmission?: ManagedAdmissionBinding;
+}
+
+/** A resolution that carries its managed admission. */
+export type ManagedResolvedApiKey = ResolvedApiKey & { managedAdmission: ManagedAdmissionBinding };
+
+/** Thrown by {@link ManagedAdmissionBinding.beforeDispatch}: the grant no longer holds at the HTTP boundary. */
+export class ManagedDispatchRefusedError extends Error {
+	readonly code: RoutingRefusalCode;
+	readonly retryAfterMs: number | null;
+	constructor(code: RoutingRefusalCode, retryAfterMs: number | null = null) {
+		super(`Managed admission refused before dispatch: ${code}`);
+		this.name = "ManagedDispatchRefusedError";
+		this.code = code;
+		this.retryAfterMs = retryAfterMs;
+	}
+}
+
+/** Narrow a resolution to one that carries a managed admission. */
+export function managedAdmissionOf(resolved: ApiKeyResolution): ManagedAdmissionBinding | undefined {
+	return typeof resolved === "object" ? resolved?.managedAdmission : undefined;
+}
+
+/**
+ * Wrap a binding so `outcome` reaches the host exactly once and `started` at most once, and the
+ * attempt can be settled by whichever layer notices the end first. `settle` is a no-op after that.
+ */
+export interface GuardedManagedAdmission extends ManagedAdmissionBinding {
+	/** The recorded outcome, or undefined while the attempt is still open. */
+	readonly settled: ManagedAttemptOutcome | undefined;
+	readonly startedAt: number | null;
+}
+
+export function guardManagedAdmission(binding: ManagedAdmissionBinding): GuardedManagedAdmission {
+	let settled: ManagedAttemptOutcome | undefined;
+	let startedAt: number | null = null;
+	return {
+		grant: binding.grant,
+		call: binding.call,
+		get settled() {
+			return settled;
+		},
+		get startedAt() {
+			return startedAt;
+		},
+		beforeDispatch: signal => binding.beforeDispatch(signal),
+		started(at) {
+			if (settled || startedAt !== null) return;
+			startedAt = at;
+			binding.started(at);
+		},
+		outcome(outcome) {
+			if (settled) return;
+			settled = outcome;
+			binding.outcome(outcome);
+		},
+	};
+}
+
+/** Outcome for an attempt that never reached the provider. */
+export function undispatchedOutcome(
+	code: "resolution_refused" | "cancelled",
+	finishedAt: number,
+	refusalReason: RoutingRefusalCode | null,
+	retryAfterMs: number | null = null,
+): ManagedAttemptOutcome {
+	return {
+		startedAt: null,
+		finishedAt,
+		code,
+		dispatch: "not_dispatched",
+		replaySafe: true,
+		refusalReason,
+		retryAfterMs,
+		quotaBlocks: [],
+		windows: [],
+	};
 }
 
 export type ApiKeyResolution = string | ResolvedApiKey | undefined;
 
-export type ApiKeyResolver = (ctx: ApiKeyResolveContext) => Promise<ApiKeyResolution> | ApiKeyResolution;
+export type ApiKeyResolver = ((ctx: ApiKeyResolveContext) => Promise<ApiKeyResolution> | ApiKeyResolution) & {
+	/** Host admission authority; present only for resolvers that serve host-managed routing. */
+	readonly managedRouting?: ManagedRoutingDriver;
+	/** Set by {@link seedApiKeyResolver}: the call the seeded admission belongs to, so a stream reuses it. */
+	readonly seededManagedCall?: ManagedCallContext;
+};
 
 /** Extract the bearer while preserving optional credential provenance for streaming callers. */
 export function resolvedApiKeyBearer(resolved: ApiKeyResolution): string | undefined {
@@ -93,10 +195,11 @@ export async function resolveApiKeyOnce(
 	key: ApiKey | undefined,
 	signal?: AbortSignal,
 	onResolved?: (resolved: ApiKeyResolution) => void,
+	managedCall?: ManagedCallContext,
 ): Promise<string | undefined> {
 	if (key === undefined) return undefined;
 	if (isApiKeyResolver(key)) {
-		const resolved = await key({ lastChance: false, error: undefined, signal });
+		const resolved = await key({ lastChance: false, error: undefined, signal, managedCall });
 		onResolved?.(resolved);
 		return resolvedApiKeyBearer(resolved);
 	}
@@ -113,13 +216,43 @@ export async function resolveApiKeyOnce(
  */
 export function seedApiKeyResolver(seed: ApiKeyResolution, resolver: ApiKeyResolver): ApiKeyResolver {
 	let seedPending = resolvedApiKeyBearer(seed) !== undefined;
-	return ctx => {
-		if (seedPending && ctx.error === undefined) {
+	const seeded: ApiKeyResolver = ctx => {
+		// A managed seed answers only the initial resolve of the call it was admitted for; every
+		// later attempt (previousOutcome set) goes back to the host for a fresh grant.
+		if (seedPending && ctx.error === undefined && ctx.previousOutcome === undefined) {
 			seedPending = false;
 			return seed;
 		}
 		return resolver(ctx);
 	};
+	return resolver.managedRouting
+		? Object.assign(seeded, {
+				managedRouting: resolver.managedRouting,
+				seededManagedCall: managedAdmissionOf(seed)?.call,
+			})
+		: seeded;
+}
+
+/** Start a managed logical call when `key` is a managed resolver; undefined for every other key. */
+export function beginManagedCall(
+	key: ApiKey | undefined,
+	input: {
+		sessionId: string | undefined;
+		modelId: string;
+		purpose?: string;
+		signal?: AbortSignal;
+		replayPolicy?: ManagedReplayPolicy;
+	},
+): ManagedCallContext | undefined {
+	const driver = isApiKeyResolver(key) ? key.managedRouting : undefined;
+	if (!driver) return undefined;
+	return driver.beginCall({
+		sessionId: input.sessionId ?? "",
+		modelId: input.modelId,
+		purpose: input.purpose ?? "other_auxiliary",
+		signal: input.signal,
+		replayPolicy: input.replayPolicy ?? "no_replay",
+	});
 }
 
 // Re-exported from the error module (its new home); see error/auth-classify.ts.
@@ -149,6 +282,12 @@ function isDirectCredentialRotationError(error: unknown): boolean {
 	return isUsageLimitOutcome(status, message);
 }
 
+/** Managed call and the outcome of the attempt that just failed, forwarded to a managed resolver. */
+export interface ManagedRetryContext {
+	call: ManagedCallContext;
+	previousOutcome?: ManagedAttemptOutcome;
+}
+
 /** Resolve a single retry step, swallowing resolver failures into `undefined`. */
 export async function resolveRetryKey(
 	resolver: ApiKeyResolver,
@@ -157,10 +296,18 @@ export async function resolveRetryKey(
 	signal?: AbortSignal,
 	previousKey?: string,
 	onResolved?: (resolved: ApiKeyResolution) => void,
+	managed?: ManagedRetryContext,
 ): Promise<string | undefined> {
 	try {
 		const rotateSibling = lastChance || (!lastChance && isDirectCredentialRotationError(error));
-		const resolved = await resolver({ lastChance: rotateSibling, error, signal, previousKey });
+		const resolved = await resolver({
+			lastChance: rotateSibling,
+			error,
+			signal,
+			previousKey,
+			managedCall: managed?.call,
+			previousOutcome: managed?.previousOutcome,
+		});
 		onResolved?.(resolved);
 		return resolvedApiKeyBearer(resolved);
 	} catch {
@@ -213,13 +360,14 @@ export async function resolveNextAuthRetryKey(
 	error: unknown,
 	signal?: AbortSignal,
 	onResolved?: (resolved: ApiKeyResolution) => void,
+	managed?: ManagedRetryContext,
 ): Promise<string | undefined> {
 	if (signal?.aborted) return undefined;
 	if (state.attempts >= AUTH_RETRY_MAX_ATTEMPTS) return undefined;
 	if (error instanceof AIError.OAuthError && error.kind === "token-refresh") {
 		if (state.tokenRefreshReplayUsed) return undefined;
 		state.tokenRefreshReplayUsed = true;
-		const refreshed = await resolveRetryKey(resolver, false, error, signal, state.lastKey, onResolved);
+		const refreshed = await resolveRetryKey(resolver, false, error, signal, state.lastKey, onResolved, managed);
 		state.refreshedCurrent = true;
 		if (signal?.aborted || refreshed === undefined) return undefined;
 		return acceptRetryKey(state, refreshed, true);
@@ -227,7 +375,7 @@ export async function resolveNextAuthRetryKey(
 	const directRotation = isDirectCredentialRotationError(error);
 	if (!directRotation) {
 		if (!state.refreshedCurrent) {
-			const refreshed = await resolveRetryKey(resolver, false, error, signal, state.lastKey, onResolved);
+			const refreshed = await resolveRetryKey(resolver, false, error, signal, state.lastKey, onResolved, managed);
 			state.refreshedCurrent = true;
 			if (signal?.aborted) return undefined;
 			if (refreshed !== undefined) {
@@ -239,10 +387,18 @@ export async function resolveNextAuthRetryKey(
 
 	if (signal?.aborted) return undefined;
 	let afterSiblingWait = false;
-	const rotated = await resolveRetryKey(resolver, true, error, signal, state.lastKey, resolved => {
-		afterSiblingWait = typeof resolved === "object" && resolved.afterSiblingWait === true;
-		onResolved?.(resolved);
-	});
+	const rotated = await resolveRetryKey(
+		resolver,
+		true,
+		error,
+		signal,
+		state.lastKey,
+		resolved => {
+			afterSiblingWait = typeof resolved === "object" && resolved.afterSiblingWait === true;
+			onResolved?.(resolved);
+		},
+		managed,
+	);
 	if (signal?.aborted || rotated === undefined) return undefined;
 	return acceptRetryKey(state, rotated, !directRotation, afterSiblingWait);
 }
@@ -281,10 +437,115 @@ async function runOAuthAttempt<T>(
  * helpers). The streaming driver in `stream.ts` implements the same policy with
  * its replay-safe buffering machinery.
  */
+export interface WithAuthOptions {
+	isAuthError?: (error: unknown) => boolean;
+	signal?: AbortSignal;
+	missingKeyMessage?: string;
+	/**
+	 * Managed resolvers only. `managedCall` reuses a call the caller already began; otherwise one is
+	 * started from `managed`. The callback is never replayed after dispatch unless `replayPolicy` is
+	 * `provider_only`, which only callbacks whose entire effect is one provider request may declare.
+	 */
+	managedCall?: ManagedCallContext;
+	managed?: { sessionId?: string; modelId: string; purpose?: string };
+	replayPolicy?: ManagedReplayPolicy;
+	/** Injected clock for outcome timestamps. */
+	now?: () => number;
+}
+
+/** Bearer-level managed retry loop: one admission, `beforeDispatch`, `started` and outcome per attempt. */
+async function withManagedAuth<T>(
+	resolver: ApiKeyResolver,
+	attempt: (key: string) => Promise<T>,
+	opts: WithAuthOptions | undefined,
+	isAuthError: (error: unknown) => boolean,
+	missingKey: () => Error,
+): Promise<T> {
+	const driver = resolver.managedRouting;
+	const signal = opts?.signal;
+	const now = opts?.now ?? Date.now;
+	const call =
+		opts?.managedCall ??
+		(driver && opts?.managed
+			? driver.beginCall({
+					sessionId: opts.managed.sessionId ?? "",
+					modelId: opts.managed.modelId,
+					purpose: opts.managed.purpose ?? "other_auxiliary",
+					signal,
+					replayPolicy: opts.replayPolicy ?? "no_replay",
+				})
+			: undefined);
+	if (!call) throw new AIError.ConfigurationError("Managed routing requires a model for withAuth");
+
+	const tried = new Set<string>();
+	let previousOutcome: ManagedAttemptOutcome | undefined;
+	let lastError: unknown;
+	let predispatchRefusals = 0;
+	let lastRefusal: unknown;
+	for (let attempts = 0; attempts < AUTH_RETRY_MAX_ATTEMPTS; attempts++) {
+		if (signal?.aborted) break;
+		let resolved: ApiKeyResolution;
+		try {
+			resolved = await resolver({
+				lastChance: false,
+				error: lastError,
+				signal,
+				managedCall: call,
+				previousOutcome,
+			});
+		} catch (error) {
+			if (lastError === undefined) throw error;
+			break;
+		}
+		const bearer = resolvedApiKeyBearer(resolved);
+		const binding = managedAdmissionOf(resolved);
+		if (bearer === undefined || !binding) {
+			if (lastError === undefined && lastRefusal === undefined) throw missingKey();
+			break;
+		}
+		const identity = `${binding.grant.accountRef.nativeRowId}\0${bearer}`;
+		if (lastError !== undefined && tried.has(identity)) break;
+		tried.add(identity);
+
+		const guarded = guardManagedAdmission(binding);
+		try {
+			await guarded.beforeDispatch(signal);
+		} catch (error) {
+			const refusal =
+				error instanceof ManagedDispatchRefusedError ? error : new ManagedDispatchRefusedError("host_unavailable");
+			guarded.outcome(undispatchedOutcome("resolution_refused", now(), refusal.code, refusal.retryAfterMs));
+			previousOutcome = guarded.settled;
+			lastRefusal = error;
+			// One bounded re-admission per refresh; a second pre-dispatch refusal surfaces.
+			if (error instanceof ManagedDispatchRefusedError && predispatchRefusals++ < 1) continue;
+			throw error;
+		}
+		const startedAt = now();
+		guarded.started(startedAt);
+		try {
+			const result = await attempt(bearer);
+			guarded.outcome(managedSuccessOutcome({ startedAt, finishedAt: now() }));
+			return result;
+		} catch (error) {
+			const outcome = managedFailureOutcome(error, {
+				startedAt,
+				finishedAt: now(),
+				replayUnsafe: false,
+				aborted: signal?.aborted === true,
+			});
+			guarded.outcome(outcome);
+			if (!isAuthError(error) || call.replayPolicy === "no_replay") throw error;
+			lastError = error;
+			previousOutcome = outcome;
+		}
+	}
+	throw lastError ?? lastRefusal ?? new AIError.AbortError();
+}
+
 export async function withAuth<T>(
 	key: ApiKey | undefined,
 	attempt: (key: string) => Promise<T>,
-	opts?: { isAuthError?: (error: unknown) => boolean; signal?: AbortSignal; missingKeyMessage?: string },
+	opts?: WithAuthOptions,
 ): Promise<T> {
 	const isAuthError = opts?.isAuthError ?? isAuthRetryableError;
 	const missingKey = (): Error => new AIError.MissingApiKeyError(undefined, opts?.missingKeyMessage);
@@ -295,6 +556,7 @@ export async function withAuth<T>(
 	}
 
 	const resolver = key;
+	if (resolver.managedRouting) return withManagedAuth(resolver, attempt, opts, isAuthError, missingKey);
 	const signal = opts?.signal;
 	const initialKey = await resolveRetryKey(resolver, false, undefined, signal);
 	if (initialKey === undefined) throw missingKey();
@@ -485,4 +747,233 @@ export async function withOAuthAccess<T>(
 	}
 
 	throw lastError;
+}
+
+// ---------------------------------------------------------------------------
+// Managed attempt outcomes
+// ---------------------------------------------------------------------------
+
+function lowercaseHeaders(headers: HeadersLike): Record<string, string> {
+	const out: Record<string, string> = {};
+	if (!headers) return out;
+	if (headers instanceof Headers) {
+		for (const [key, value] of headers.entries()) out[key.toLowerCase()] = value;
+		return out;
+	}
+	for (const [key, value] of Object.entries(headers)) {
+		if (typeof value === "string") out[key.toLowerCase()] = value;
+	}
+	return out;
+}
+
+/** Quantitative windows the provider reported in unified rate-limit response headers. */
+export function managedWindowsFromHeaders(headers: HeadersLike, nowMs: number): RoutingWindow[] {
+	const report = parseClaudeRateLimitHeaders(lowercaseHeaders(headers), nowMs);
+	return readRoutingObservation(report)?.windowObservations ?? [];
+}
+
+/**
+ * Confirmed exhaustion from an authenticated Messages rejection: a window the provider itself reports
+ * at utilization>=1 with a future reset. A bare 429, concurrency or body-only text never qualifies.
+ */
+function exhaustedWindows(windows: readonly RoutingWindow[], nowMs: number): RoutingQuotaBlock[] {
+	const blocks: RoutingQuotaBlock[] = [];
+	for (const window of windows) {
+		if (window.usedFraction === null || window.usedFraction < 1) continue;
+		if (window.resetAt === null || window.resetAt <= nowMs) continue;
+		blocks.push({
+			limitId: window.id,
+			scope: window.scope,
+			resetAt: window.resetAt,
+			observedAt: nowMs,
+			source: "provider-rejection",
+			confirmed: true,
+		});
+	}
+	return blocks;
+}
+
+/** Outcome of a dispatched attempt that produced a response. */
+export function managedSuccessOutcome(input: {
+	startedAt: number;
+	finishedAt: number;
+	headers?: HeadersLike;
+}): ManagedAttemptOutcome {
+	return {
+		startedAt: input.startedAt,
+		finishedAt: input.finishedAt,
+		code: "success",
+		dispatch: "dispatched",
+		replaySafe: false,
+		refusalReason: null,
+		retryAfterMs: null,
+		quotaBlocks: [],
+		windows: managedWindowsFromHeaders(input.headers, input.finishedAt),
+	};
+}
+
+/**
+ * Map a failed dispatched attempt onto the allowlisted outcome vocabulary. Never carries error text.
+ * `replayUnsafe` is true once output reached the consumer or a tool call may have escaped.
+ */
+export function managedFailureOutcome(
+	error: unknown,
+	input: { startedAt: number; finishedAt: number; replayUnsafe: boolean; aborted?: boolean },
+): ManagedAttemptOutcome {
+	const headers = getHeadersFromError(error);
+	const windows = managedWindowsFromHeaders(headers, input.finishedAt);
+	const status = AIError.status(error);
+	const base = {
+		startedAt: input.startedAt,
+		finishedAt: input.finishedAt,
+		dispatch: input.replayUnsafe ? ("replay_unsafe" as const) : ("dispatched" as const),
+		replaySafe: !input.replayUnsafe,
+		refusalReason: null,
+		windows,
+	};
+	if (input.aborted || error instanceof AIError.AbortError) {
+		return { ...base, code: "cancelled", retryAfterMs: null, quotaBlocks: [] };
+	}
+	const retryAfterMs = getRetryAfterMsFromHeaders(headers) ?? null;
+	if (status === 429) {
+		const quotaBlocks = exhaustedWindows(windows, input.finishedAt);
+		if (quotaBlocks.length > 0) return { ...base, code: "quota_exhausted", retryAfterMs, quotaBlocks };
+		return { ...base, code: "rate_limited", retryAfterMs, quotaBlocks: [] };
+	}
+	if (status === 401 || status === 403 || isInvalidatedOAuthTokenError(error)) {
+		return { ...base, code: "auth_failed", retryAfterMs: null, quotaBlocks: [] };
+	}
+	if (status === undefined) return { ...base, code: "network_failed", retryAfterMs: null, quotaBlocks: [] };
+	return { ...base, code: "provider_failed", retryAfterMs, quotaBlocks: [] };
+}
+
+// ---------------------------------------------------------------------------
+// Per-call attempt source
+// ---------------------------------------------------------------------------
+
+/** What a provider needs to build exactly one HTTP request under an admitted grant. */
+export interface AdmittedManagedAttempt {
+	apiKey: string;
+	credentialId: number | undefined;
+	oauthIdentity: OAuthRequestIdentity | undefined;
+}
+
+/**
+ * Supplies one admitted grant per actual provider HTTP attempt of a single logical call.
+ *
+ * The first attempt uses the seeded resolution; every later attempt (provider retry, body repair,
+ * empty-completion retry) asks the host again with the previous outcome, so each attempt carries its
+ * own grant, `beforeDispatch` guard and exactly-one outcome. A pre-dispatch refusal triggers one
+ * bounded re-admission; a second refusal surfaces as {@link ManagedDispatchRefusedError}.
+ */
+export class ManagedAttemptSource {
+	readonly call: ManagedCallContext;
+	readonly #readmit: (
+		previous: ManagedAttemptOutcome | undefined,
+		signal: AbortSignal | undefined,
+	) => Promise<ApiKeyResolution>;
+	readonly #now: () => number;
+	#seed: ManagedResolvedApiKey | undefined;
+	#open: GuardedManagedAdmission | undefined;
+	#last: ManagedAttemptOutcome | undefined;
+	#startedAt: number | null = null;
+
+	constructor(
+		call: ManagedCallContext,
+		seed: ManagedResolvedApiKey,
+		readmit: (
+			previous: ManagedAttemptOutcome | undefined,
+			signal: AbortSignal | undefined,
+		) => Promise<ApiKeyResolution>,
+		now: () => number = Date.now,
+	) {
+		this.call = call;
+		this.#seed = seed;
+		this.#readmit = readmit;
+		this.#now = now;
+	}
+
+	/** Outcome of the most recently settled attempt. */
+	get lastOutcome(): ManagedAttemptOutcome | undefined {
+		return this.#last;
+	}
+
+	/** Admit the next HTTP attempt and run its `beforeDispatch` guard. Throws when the host declines. */
+	async admit(signal?: AbortSignal): Promise<AdmittedManagedAttempt> {
+		this.settleOpen(undefined);
+		for (let refusals = 0; ; refusals++) {
+			let resolved: ApiKeyResolution;
+			if (this.#seed) {
+				resolved = this.#seed;
+				this.#seed = undefined;
+			} else {
+				if (signal?.aborted) throw new ManagedDispatchRefusedError("cancelled");
+				resolved = await this.#readmit(this.#last, signal);
+			}
+			const bearer = resolvedApiKeyBearer(resolved);
+			const binding = managedAdmissionOf(resolved);
+			if (bearer === undefined || !binding) {
+				throw new ManagedDispatchRefusedError(this.#last?.refusalReason ?? "host_unavailable");
+			}
+			const guarded = guardManagedAdmission(binding);
+			try {
+				await guarded.beforeDispatch(signal);
+			} catch (error) {
+				const refusal =
+					error instanceof ManagedDispatchRefusedError
+						? error
+						: new ManagedDispatchRefusedError("host_unavailable");
+				guarded.outcome(undispatchedOutcome("resolution_refused", this.#now(), refusal.code, refusal.retryAfterMs));
+				this.#last = guarded.settled;
+				if (refusals >= 1) throw refusal;
+				continue;
+			}
+			this.#open = guarded;
+			this.#startedAt = null;
+			const credential = typeof resolved === "object" ? resolved : undefined;
+			return { apiKey: bearer, credentialId: credential?.credentialId, oauthIdentity: credential?.oauthIdentity };
+		}
+	}
+
+	/** Immediately before the provider request leaves. */
+	started(): void {
+		const open = this.#open;
+		if (!open || this.#startedAt !== null) return;
+		this.#startedAt = this.#now();
+		open.started(this.#startedAt);
+	}
+
+	succeed(headers?: HeadersLike): void {
+		const open = this.#open;
+		if (!open) return;
+		this.#settle(
+			open,
+			managedSuccessOutcome({ startedAt: this.#startedAt ?? this.#now(), finishedAt: this.#now(), headers }),
+		);
+	}
+
+	fail(error: unknown, input: { replayUnsafe: boolean; aborted: boolean }): void {
+		this.settleOpen(error, input);
+	}
+
+	/** Settle any still-open attempt; the last line of defence for exactly-one outcome. */
+	settleOpen(
+		error: unknown,
+		input: { replayUnsafe: boolean; aborted: boolean } = { replayUnsafe: false, aborted: false },
+	): void {
+		const open = this.#open;
+		if (!open) return;
+		const finishedAt = this.#now();
+		const outcome =
+			this.#startedAt === null
+				? undispatchedOutcome("cancelled", finishedAt, null)
+				: managedFailureOutcome(error, { startedAt: this.#startedAt, finishedAt, ...input });
+		this.#settle(open, outcome);
+	}
+
+	#settle(open: GuardedManagedAdmission, outcome: ManagedAttemptOutcome): void {
+		open.outcome(outcome);
+		this.#last = open.settled ?? outcome;
+		this.#open = undefined;
+	}
 }

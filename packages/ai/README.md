@@ -1229,6 +1229,37 @@ single best anchor; there is no chaining between neighbours. Subscription tier (
 not available from the usage payload, so plan eligibility is an input, and the result is a
 window-pressure heuristic, not token capacity.
 
+### Host-managed Claude routing
+
+`authStorage.routing` serves a host that owns account choice. `resolveExact({ accountRef, modelId, baseUrl,
+admission, call, lifecycle, signal })` turns one granted native row into a bearer or a typed refusal
+(`{ refusal: true, code, retryAfterMs }`). It addresses the row by `{ storeNamespace, nativeRowId }` and re-reads
+it by id after every await, so deletion or index compaction cannot retarget a sibling. It never ranks, rotates,
+falls back to a sibling, API key or environment credential, enters the permissive cascade (a static or config key
+for `anthropic` refuses `auth_unavailable`), or writes a durable native quota block. Billing must be explicitly
+`disabled` inside its 300000ms span, rechecked after the usage read and again in `beforeDispatch`.
+`refreshMetadata` reads fresh billing and window evidence for one row, and `rankCandidates` is
+`rankRoutingCandidates`. Inject a clock with `AuthStorageOptions.routingClock`.
+
+A resolver opts in with a `managedRouting` driver (`beginCall`, `acquire`, `isConfigured`). One logical model call
+gets one `ManagedCallContext` (`operationId`, monotonic `requestGeneration`); the agent loop begins it before
+pre-resolution and the seeded resolver hands it to the stream, so the seed is the call's first admission. Every
+actual Anthropic HTTP attempt (auth, provider-error, body-repair and empty-completion retries) then asks the host
+again with the previous outcome, gets a new `attemptId`, runs `beforeDispatch`, reports `started`, and settles
+exactly one `ManagedAttemptOutcome`. A grant that expires before the fetch settles `resolution_refused` with
+`startedAt: null` and gets one bounded re-admission. Request metadata and the bearer follow the serving row
+(`oauthIdentity.accountId`), not the session pin; an in-flight attempt keeps its own grant when the host moves on.
+
+Positive exhaustion is a response window at utilization `>= 1` with a future reset (`quota_exhausted` with
+`quotaBlocks`); a bare 429, body-only text, utilization below 1, or a missing or past reset is `rate_limited`.
+Outcomes never carry error text. Nonstreaming `withAuth` defaults to `replayPolicy: "no_replay"`; only callbacks
+whose whole effect is one provider request may pass `"provider_only"`. Managed failures never enter API-key,
+sibling, model or cross-provider fallback. The seeded call is not settled if the agent loop is cancelled before
+the stream starts; the host releases such a grant by `operationId`.
+
+Not available yet: subscription tier is unknown, so no plan-entitlement gate runs, and the end-to-end capability
+stays off until the owned-runtime adapter and final auxiliary cutover land.
+
 ### Provider Notes
 
 **OpenAI Codex**: Requires a ChatGPT Plus or Pro subscription. Provides access to GPT-5.x Codex models with extended context windows and reasoning capabilities. The library automatically handles session-based prompt caching when `sessionId` is provided in stream options.

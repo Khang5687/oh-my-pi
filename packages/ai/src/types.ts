@@ -36,7 +36,7 @@ import type {
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { Api, FetchImpl, KnownApi, Model, Provider, ThinkingBudgets, Usage } from "@oh-my-pi/pi-catalog/types";
-import type { ApiKey } from "./auth-retry";
+import type { ApiKey, ManagedAttemptSource } from "./auth-retry";
 import type { OAuthRequestIdentity } from "./auth/types";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
@@ -502,6 +502,8 @@ export interface StreamOptions {
 	credentialId?: number;
 	/** @internal Non-secret identity of the bearer serving this attempt; never persisted in history. */
 	oauthIdentity?: OAuthRequestIdentity;
+	/** @internal Per-HTTP-attempt admission for host-managed routing; the provider re-admits before every request. */
+	managedAttempts?: ManagedAttemptSource;
 	cacheRetention?: CacheRetention;
 	/**
 	 * Anthropic preserved-thinking behavior when a signed block no longer matches

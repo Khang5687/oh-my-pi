@@ -7,12 +7,14 @@ import type {
 	OAuthProviderId,
 } from "../registry/oauth/types";
 import type { Provider } from "../types";
+import type { RoutingQuotaBlock } from "./rank";
 import type {
 	ClientUsageIdentity,
 	ClientUsageReport,
 	ClientUsageSummary,
 	CredentialRankingStrategy,
 	RoutingObservation,
+	RoutingWindow,
 	UsageHistoryEntry,
 	UsageHistoryQuery,
 	UsageLogger,
@@ -339,6 +341,8 @@ export type AuthStorageOptions = {
 	/** Global reserve fallback for accounts without a matching reservePct policy. */
 	defaultReservePct?: number;
 	usageFetch?: typeof fetch;
+	/** Injected clock for managed-routing admission (billing expiry, quota resets). Defaults to `Date.now`. */
+	routingClock?: () => number;
 	usageRequestTimeoutMs?: number;
 	usageLogger?: UsageLogger;
 	/**
@@ -518,6 +522,8 @@ export function oauthAccountKey(identity: {
 
 /** Non-secret identity bound to the OAuth credential selected for one request attempt. */
 export interface OAuthRequestIdentity {
+	/** Provider account id of the row serving this attempt (never the mutable session pin). */
+	accountId?: string;
 	orgId?: string;
 	region?: string;
 	inferenceRegion?: "global" | "eu" | "us";
@@ -1496,4 +1502,114 @@ export interface BlocksApi {
 	delete(credentialId: number, providerKey: string, blockScope: string): void;
 	/** Delete all persisted blocks for a credential. */
 	deleteAll(credentialId: number): void;
+}
+
+// ---------------------------------------------------------------------------
+// Managed routing: per-call and per-HTTP-attempt admission provenance.
+// ---------------------------------------------------------------------------
+
+/** Canonical refusal codes shared by native admission and the host. */
+export const ROUTING_REFUSAL_CODES = [
+	"no_account",
+	"source_changed",
+	"source_inaccessible",
+	"billing_enabled",
+	"billing_unknown",
+	"quota_blocked",
+	"entitlement_unavailable",
+	"auth_unavailable",
+	"unsupported_transport",
+	"unsupported_runtime",
+	"persistence_failed",
+	"host_unavailable",
+	"cancelled",
+] as const;
+export type RoutingRefusalCode = (typeof ROUTING_REFUSAL_CODES)[number];
+
+/** Canonical outcome codes. Exception text never crosses into an outcome. */
+export type ManagedOutcomeCode =
+	| "success"
+	| "cancelled"
+	| "quota_exhausted"
+	| "auth_failed"
+	| "rate_limited"
+	| "network_failed"
+	| "provider_failed"
+	| "resolution_refused";
+
+/** `not_dispatched`: no provider request left. `replay_unsafe`: output may have escaped to the consumer. */
+export type ManagedDispatchStatus = "not_dispatched" | "dispatched" | "replay_unsafe";
+
+/** Whether a nonstreaming caller may re-run its callback after a dispatched failure. */
+export type ManagedReplayPolicy = "provider_only" | "no_replay";
+
+/** Metadata-only result of one actual provider HTTP attempt. `startedAt:null` means nothing was dispatched. */
+export interface ManagedAttemptOutcome {
+	startedAt: number | null;
+	finishedAt: number;
+	code: ManagedOutcomeCode;
+	dispatch: ManagedDispatchStatus;
+	replaySafe: boolean;
+	refusalReason: RoutingRefusalCode | null;
+	retryAfterMs: number | null;
+	quotaBlocks: RoutingQuotaBlock[];
+	windows: RoutingWindow[];
+}
+
+/** One logical model invocation. Spans auth, quota and provider retries; a following model call gets a new one. */
+export interface ManagedCallContext {
+	operationId: string;
+	/** Allocated once per native adapter call, monotonically. */
+	requestGeneration: number;
+	sessionId: string;
+	modelId: string;
+	purpose: string;
+	signal?: AbortSignal;
+	replayPolicy: ManagedReplayPolicy;
+}
+
+/** Host decision to serve exactly one HTTP attempt from one native row. */
+export interface ManagedAdmissionGrant {
+	hostEpoch: string;
+	runtimeInstanceId: string;
+	admissionId: string;
+	selectionGeneration: number;
+	policyRevision: number;
+	accountRef: AccountRef;
+	operationId: string;
+	/** Changes for every actual provider HTTP attempt. */
+	attemptId: string;
+	requestGeneration: number;
+	sessionId: string;
+	modelId: string;
+	purpose: string;
+}
+
+/**
+ * Per-attempt lifecycle handle carried with a resolved bearer. `started` fires immediately before
+ * the provider request, `outcome` exactly once per grant (the wrapper drops later calls).
+ */
+export interface ManagedAdmissionBinding {
+	grant: ManagedAdmissionGrant;
+	call: ManagedCallContext;
+	/** Re-validates the exact row, identity and billing at the real HTTP boundary; rejects before any fetch. */
+	beforeDispatch(signal?: AbortSignal): Promise<void>;
+	started(startedAt: number): void;
+	outcome(outcome: ManagedAttemptOutcome): void;
+}
+
+/** Host-owned admission authority consumed by the native stream and auth paths. */
+export interface ManagedRoutingDriver {
+	beginCall(input: {
+		sessionId: string;
+		modelId: string;
+		purpose: string;
+		signal?: AbortSignal;
+		replayPolicy: ManagedReplayPolicy;
+	}): ManagedCallContext;
+	acquire(
+		call: ManagedCallContext,
+		options: { previousOutcome?: ManagedAttemptOutcome; forceRefresh?: boolean },
+	): Promise<ManagedAdmissionGrant>;
+	isConfigured(grant: ManagedAdmissionGrant): boolean;
 }

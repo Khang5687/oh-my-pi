@@ -2,8 +2,17 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { withOAuthAccess } from "@oh-my-pi/pi-ai/auth-retry";
-import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import { type ManagedResolvedApiKey, withOAuthAccess } from "@oh-my-pi/pi-ai/auth-retry";
+import {
+	type AccountRef,
+	AuthStorage,
+	type ManagedAdmissionGrant,
+	type ManagedAttemptOutcome,
+	type ManagedCallContext,
+	type RoutingRefusal,
+	SqliteAuthCredentialStore,
+} from "@oh-my-pi/pi-ai/auth-storage";
+import * as claudeUsage from "@oh-my-pi/pi-ai/usage/claude";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 
 const PROVIDER = "unit-oauth-select";
@@ -286,5 +295,238 @@ describe("AuthStorage OAuth account selection", () => {
 		expect("accessToken" in result).toBe(false);
 		// Target-only: no sibling credential was refreshed/rotated on the failure path.
 		expect(seen).toEqual(["access-b"]);
+	});
+});
+
+describe("AuthStorage.routing strict exact-row resolution", () => {
+	const NOW = 1_800_000_000_000;
+	const BASE_URL = "https://api.anthropic.com/v1";
+	const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+	const MODEL = "claude-sonnet-5-5";
+	const ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
+	const savedEnv: Record<string, string | undefined> = {};
+	let dir = "";
+	let credentialStore: SqliteAuthCredentialStore;
+	let storage: AuthStorage;
+	let clock = NOW;
+	let usageBody: (bearer: string) => Record<string, unknown>;
+	let usageGate: Promise<void> | null = null;
+	let usageBearers: string[] = [];
+	let namespace = "";
+	let started: Array<{ grant: ManagedAdmissionGrant; at: number }> = [];
+	let outcomes: Array<{ grant: ManagedAdmissionGrant; outcome: ManagedAttemptOutcome }> = [];
+	let configured = true;
+
+	const lifecycle = {
+		isConfigured: () => configured,
+		started: (grant: ManagedAdmissionGrant, at: number) => started.push({ grant, at }),
+		outcome: (grant: ManagedAdmissionGrant, outcome: ManagedAttemptOutcome) => outcomes.push({ grant, outcome }),
+	};
+
+	function ref(nativeRowId: number): AccountRef {
+		return { storeNamespace: namespace, nativeRowId };
+	}
+	function call(signal?: AbortSignal): ManagedCallContext {
+		return {
+			operationId: "op-1",
+			requestGeneration: 1,
+			sessionId: "s",
+			modelId: MODEL,
+			purpose: "agent_turn",
+			replayPolicy: "no_replay",
+			signal,
+		};
+	}
+	function grant(accountRef: AccountRef): ManagedAdmissionGrant {
+		return {
+			hostEpoch: "epoch",
+			runtimeInstanceId: "rt",
+			admissionId: "adm",
+			selectionGeneration: 1,
+			policyRevision: 1,
+			accountRef,
+			operationId: "op-1",
+			attemptId: "att-1",
+			requestGeneration: 1,
+			sessionId: "s",
+			modelId: MODEL,
+			purpose: "agent_turn",
+		};
+	}
+	function resolve(row: number, signal?: AbortSignal, accountRef: AccountRef = ref(row)) {
+		return storage.routing.resolveExact({
+			accountRef,
+			modelId: MODEL,
+			baseUrl: BASE_URL,
+			admission: grant(accountRef),
+			call: call(signal),
+			lifecycle,
+			signal,
+		});
+	}
+	const refused = (result: ManagedResolvedApiKey | RoutingRefusal): RoutingRefusal => {
+		if (!("refusal" in result)) throw new Error("expected refusal");
+		return result;
+	};
+
+	beforeEach(async () => {
+		for (const key of ENV) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+		dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-routing-"));
+		credentialStore = await SqliteAuthCredentialStore.open(path.join(dir, "agent.db"));
+		clock = NOW;
+		usageGate = null;
+		usageBearers = [];
+		started = [];
+		outcomes = [];
+		configured = true;
+		usageBody = () => ({ five_hour: { utilization: 30 }, seven_day: { utilization: 40 }, spend: { enabled: false } });
+		const usageFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+			if (url !== USAGE_URL) return new Response("{}", { status: 404 });
+			const bearer = new Headers(init?.headers).get("authorization")?.replace(/^Bearer /i, "") ?? "";
+			usageBearers.push(bearer);
+			if (usageGate) await usageGate;
+			return new Response(JSON.stringify(usageBody(bearer)), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		storage = new AuthStorage(credentialStore, {
+			usageFetch,
+			routingClock: () => clock,
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+		});
+		const credentials = ["a", "b", "c"].map(suffix => ({ ...oauthCredential(suffix) }));
+		await storage.credentials.set("anthropic", credentials);
+		const source = storage.credentials.routingIdentities({ provider: "anthropic" }).source;
+		if (source.status !== "supported") throw new Error("expected supported namespace");
+		namespace = source.storeNamespace;
+	});
+
+	afterEach(async () => {
+		credentialStore.close();
+		await fs.rm(dir, { recursive: true, force: true });
+		for (const key of ENV) {
+			if (savedEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = savedEnv[key];
+		}
+	});
+
+	const rowId = (suffix: string): number => {
+		const account = storage.credentials
+			.routingIdentities({ provider: "anthropic" })
+			.accounts.find(candidate => candidate.accountId === `acc-${suffix}`);
+		if (!account) throw new Error(`no row ${suffix}`);
+		return account.ref.nativeRowId;
+	};
+
+	test("resolves exactly the granted row with its own bearer and serving account identity", async () => {
+		const b = rowId("b");
+		const result = await resolve(b);
+		if ("refusal" in result) throw new Error(`refused: ${result.code}`);
+		expect(result.apiKey).toBe("access-b");
+		expect(result.credentialId).toBe(b);
+		expect(result.oauthIdentity?.accountId).toBe("acc-b");
+		expect(usageBearers).toEqual(["access-b"]);
+		await result.managedAdmission.beforeDispatch();
+		result.managedAdmission.started(NOW);
+		expect(started.map(entry => entry.grant.attemptId)).toEqual(["att-1"]);
+		expect(outcomes).toHaveLength(0);
+	});
+
+	test("billing enabled refuses with exactly one resolution_refused outcome and no bearer", async () => {
+		usageBody = () => ({ five_hour: { utilization: 1 }, spend: { enabled: true } });
+		const refusal = refused(await resolve(rowId("a")));
+		expect(refusal.code).toBe("billing_enabled");
+		expect(outcomes).toHaveLength(1);
+		expect(outcomes[0]?.outcome).toMatchObject({
+			code: "resolution_refused",
+			startedAt: null,
+			dispatch: "not_dispatched",
+			refusalReason: "billing_enabled",
+		});
+		expect(started).toHaveLength(0);
+	});
+
+	test("missing billing evidence is unknown, never assumed included", async () => {
+		usageBody = () => ({ five_hour: { utilization: 1 } });
+		expect(refused(await resolve(rowId("a"))).code).toBe("billing_unknown");
+	});
+
+	test("confirmed exhaustion of an applicable window refuses quota_blocked with the reset delay", async () => {
+		const resetAt = new Date(NOW + 90 * 60_000).toISOString();
+		usageBody = () => ({
+			five_hour: { utilization: 100, resets_at: resetAt },
+			seven_day: { utilization: 10 },
+			spend: { enabled: false },
+		});
+		const refusal = refused(await resolve(rowId("a")));
+		expect(refusal.code).toBe("quota_blocked");
+		expect(refusal.retryAfterMs).toBe(90 * 60_000);
+	});
+
+	test("the row deleted and compacted during the refresh never retargets a sibling", async () => {
+		const a = rowId("a");
+		const gate = Promise.withResolvers<void>();
+		usageGate = gate.promise;
+		const pending = resolve(a);
+		await Bun.sleep(30);
+		await credentialStore.deleteAuthCredential(a, "test");
+		await storage.credentials.reload();
+		gate.resolve();
+		const refusal = refused(await pending);
+		expect(refusal.code).toBe("no_account");
+		expect(usageBearers).not.toContain("access-b");
+		expect(usageBearers).not.toContain("access-c");
+	});
+
+	test("billing evidence expiring before dispatch revokes the grant at beforeDispatch", async () => {
+		const result = await resolve(rowId("a"));
+		if ("refusal" in result) throw new Error("expected bearer");
+		clock = NOW + 300_001;
+		await expect(result.managedAdmission.beforeDispatch()).rejects.toMatchObject({ code: "billing_unknown" });
+	});
+
+	test("a host epoch change or cancellation revokes the grant at beforeDispatch", async () => {
+		const result = await resolve(rowId("a"));
+		if ("refusal" in result) throw new Error("expected bearer");
+		configured = false;
+		await expect(result.managedAdmission.beforeDispatch()).rejects.toMatchObject({ code: "host_unavailable" });
+		configured = true;
+		const controller = new AbortController();
+		controller.abort();
+		await expect(result.managedAdmission.beforeDispatch(controller.signal)).rejects.toMatchObject({
+			code: "cancelled",
+		});
+	});
+
+	test("a static key override, foreign namespace, untrusted base URL and abort refuse without a provider request", async () => {
+		const a = rowId("a");
+		storage.keys.setRuntime("anthropic", "sk-ant-api-runtime");
+		expect(refused(await resolve(a)).code).toBe("auth_unavailable");
+		storage.keys.removeRuntime("anthropic");
+		const foreign = { storeNamespace: "7c9e6679-7425-40de-944b-e07fc1f90ae7", nativeRowId: a };
+		expect(refused(await resolve(a, undefined, foreign)).code).toBe("source_changed");
+		const untrusted = await storage.routing.resolveExact({
+			accountRef: ref(a),
+			modelId: MODEL,
+			baseUrl: "https://api.example.com/v1",
+			admission: grant(ref(a)),
+			call: call(),
+			lifecycle,
+		});
+		expect(refused(untrusted).code).toBe("unsupported_transport");
+		const controller = new AbortController();
+		controller.abort();
+		expect(refused(await resolve(a, controller.signal)).code).toBe("cancelled");
+		expect(usageBearers).toHaveLength(0);
+		expect(outcomes.every(entry => entry.outcome.startedAt === null)).toBe(true);
+	});
+
+	test("an unknown row id refuses no_account", async () => {
+		expect(refused(await resolve(999)).code).toBe("no_account");
 	});
 });
