@@ -18,6 +18,9 @@ import {
 	type OAuthRefreshReason,
 	REMOTE_REFRESH_SENTINEL,
 	type RemoteOAuthCredential,
+	type RoutingSourceIdentity,
+	ROUTING_SOURCE_UNSUPPORTED,
+	isStoreNamespace,
 	type StoredAuthCredential,
 	type StoredCredentialBlock,
 } from "../auth/types";
@@ -581,6 +584,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	#applyStreamEvent(event: SnapshotStreamEvent): void {
+		// Deltas must come from the namespace the baseline snapshot named; anything
+		// else (replaced or downgraded broker) forces a reconnect and fresh baseline.
+		if (event.kind !== "snapshot" && event.storeNamespace !== this.#snapshot.storeNamespace) {
+			throw new AuthBrokerError("Auth broker stream delta namespace differs from snapshot");
+		}
 		switch (event.kind) {
 			case "snapshot": {
 				// The first frame of every SSE connection is a full authoritative
@@ -687,6 +695,18 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (this.#credentialRevision === this.#acknowledgedRevision) return false;
 		this.#acknowledgedRevision = this.#credentialRevision;
 		return true;
+	}
+
+	/** Namespace advertised by the broker's current snapshot; absent (old broker) or malformed means unsupported. */
+	routingSourceIdentity(): RoutingSourceIdentity {
+		const storeNamespace = this.#snapshot.storeNamespace;
+		if (!isStoreNamespace(storeNamespace)) return ROUTING_SOURCE_UNSUPPORTED;
+		return { status: "supported", storeNamespace, reason: null };
+	}
+
+	/** An account-pool filter hides broker rows, so the local listing cannot prove a row is absent. */
+	routingListingComplete(): boolean {
+		return this.#accountPool === undefined;
 	}
 
 	listAuthCredentials(provider?: string): StoredAuthCredential[] {

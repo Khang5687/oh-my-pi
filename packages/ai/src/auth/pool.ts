@@ -3,7 +3,7 @@ import { resolveCredentialIdentityKey, serializeCredential } from "./sqlite-cred
 import type { BlockStoreHealth } from "./blocks";
 import type { AccountPolicies } from "./policy";
 import type { AuthCredentialStore } from "./store";
-import { REMOTE_REFRESH_SENTINEL } from "./types";
+import { isStoreNamespace, REMOTE_REFRESH_SENTINEL, ROUTING_SOURCE_UNSUPPORTED } from "./types";
 import type {
 	ApiKeyCredential,
 	AuthCredential,
@@ -15,6 +15,8 @@ import type {
 	CredentialsApi,
 	DisabledCredentialSummary,
 	OAuthCredential,
+	RoutingIdentityCatalog,
+	RoutingSourceIdentity,
 	SnapshotCredential,
 	StoredAuthCredential,
 } from "./types";
@@ -103,6 +105,8 @@ export class CredentialPool implements CredentialsApi {
 	 */
 	#pendingDisabledEvents: CredentialDisabledEvent[] = [];
 	#generation = 1;
+	/** Time of the last reload that fully completed; null before the first one and while a reload is failing. */
+	#authoritativeObservedAt: number | null = null;
 	#generationListeners: Set<(generation: number) => void> = new Set();
 	#closed = false;
 
@@ -278,6 +282,7 @@ export class CredentialPool implements CredentialsApi {
 	 * Reload credentials from storage.
 	 */
 	async reload(): Promise<void> {
+		this.#authoritativeObservedAt = null;
 		let records: StoredAuthCredential[];
 		try {
 			records = this.#store.listAuthCredentials();
@@ -315,6 +320,50 @@ export class CredentialPool implements CredentialsApi {
 		for (const provider of removedProviders) {
 			this.replace(provider, []);
 		}
+		this.#authoritativeObservedAt = Date.now();
+	}
+
+	routingIdentities(_options: { provider: "anthropic" }): RoutingIdentityCatalog {
+		let source: RoutingSourceIdentity;
+		try {
+			source = this.#store.routingSourceIdentity?.() ?? ROUTING_SOURCE_UNSUPPORTED;
+		} catch {
+			source = ROUTING_SOURCE_UNSUPPORTED;
+		}
+		// Re-validate: a store must never mint refs from a malformed namespace.
+		if (source.status !== "supported" || !isStoreNamespace(source.storeNamespace)) {
+			return {
+				source: ROUTING_SOURCE_UNSUPPORTED,
+				credentialGeneration: this.#generation,
+				authoritativeObservedAt: null,
+				authoritativeComplete: false,
+				accounts: [],
+			};
+		}
+		const storeNamespace = source.storeNamespace;
+		const accounts: RoutingIdentityCatalog["accounts"] = [];
+		for (const { id, credential } of this.entries("anthropic")) {
+			if (credential.type !== "oauth" || !Number.isSafeInteger(id) || id <= 0) continue;
+			accounts.push({
+				ref: { storeNamespace, nativeRowId: id },
+				provider: "anthropic",
+				accountId: credential.accountId ?? null,
+				email: credential.email ?? null,
+				organizationId: credential.orgId ?? null,
+				organizationName: credential.orgName ?? null,
+				// Pool rows are active (disabled rows are tombstoned out of the store listing).
+				credentialAvailable: true,
+			});
+		}
+		accounts.sort((a, b) => a.ref.nativeRowId - b.ref.nativeRowId);
+		const complete = this.#authoritativeObservedAt !== null && (this.#store.routingListingComplete?.() ?? true);
+		return {
+			source,
+			credentialGeneration: this.#generation,
+			authoritativeObservedAt: complete ? this.#authoritativeObservedAt : null,
+			authoritativeComplete: complete,
+			accounts,
+		};
 	}
 
 	/**

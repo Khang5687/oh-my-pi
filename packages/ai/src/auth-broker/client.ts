@@ -30,7 +30,7 @@ import type {
 	UsageResponse,
 	UsageStaleResponse,
 } from "./types";
-import { AUTH_BROKER_CAPABILITIES_HEADER, AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES } from "./types";
+import { AUTH_BROKER_CAPABILITIES_HEADER, AUTH_BROKER_CLIENT_CAPABILITIES } from "./types";
 import { parseGenerationTag } from "./protocol";
 import {
 	clientUsageReportResponseSchema,
@@ -147,7 +147,7 @@ export class AuthBrokerClient {
 		if (opts.waitMs !== undefined) query.set("wait", String(opts.waitMs));
 		const path = `/v1/snapshot${query.size > 0 ? `?${query.toString()}` : ""}`;
 		const headers: Record<string, string> = {
-			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CLIENT_CAPABILITIES,
 		};
 		if (opts.ifGenerationGt !== undefined) headers["If-None-Match"] = `"${opts.ifGenerationGt}"`;
 		const timeoutMs =
@@ -189,7 +189,7 @@ export class AuthBrokerClient {
 		const headers: Record<string, string> = {
 			Accept: "text/event-stream",
 			Authorization: `Bearer ${this.#token}`,
-			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+			[AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CLIENT_CAPABILITIES,
 		};
 		if (opts.signal?.aborted) {
 			throw new AuthBrokerError("Auth broker request aborted", { cause: opts.signal.reason });

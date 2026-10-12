@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a persistent opaque source namespace to the SQLite credential store, the `CredentialsApi.routingIdentities()` identity-only catalog, and the optional `source-identity-v1` auth-broker capability that carries the namespace to negotiated clients; old brokers and stores without a namespace report `unsupported` and keep working unchanged
+
 ## [18.9.2] - 2026-10-11
 
 ### Breaking Changes

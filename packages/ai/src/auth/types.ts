@@ -792,8 +792,57 @@ export type OAuthLoginController = OAuthController & {
 	onPrompt: (prompt: OAuthPrompt) => Promise<string>;
 };
 
+/** Opaque identity of the authoritative credential store that owns native row ids. */
+export interface AccountRef {
+	storeNamespace: string;
+	nativeRowId: number;
+}
+
+/** Whether a credential source can mint route refs. Namespace-less sources are unsupported. */
+export type RoutingSourceIdentity =
+	| { status: "supported"; storeNamespace: string; reason: null }
+	| { status: "unsupported"; storeNamespace: null; reason: "namespace_unavailable" };
+
+export const ROUTING_SOURCE_UNSUPPORTED: RoutingSourceIdentity = {
+	status: "unsupported",
+	storeNamespace: null,
+	reason: "namespace_unavailable",
+};
+
+const STORE_NAMESPACE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** True for a lowercase UUIDv4, the only shape a store namespace may take. */
+export function isStoreNamespace(value: unknown): value is string {
+	return typeof value === "string" && STORE_NAMESPACE_PATTERN.test(value);
+}
+
+/** Identity-only projection of one loaded Anthropic OAuth row. Carries no bearer, refresh token or store path. */
+export interface RoutingIdentityAccount {
+	ref: AccountRef;
+	provider: "anthropic";
+	accountId: string | null;
+	email: string | null;
+	organizationId: string | null;
+	organizationName: string | null;
+	credentialAvailable: boolean;
+}
+
+/** Result of {@link CredentialsApi.routingIdentities}. */
+export interface RoutingIdentityCatalog {
+	source: RoutingSourceIdentity;
+	credentialGeneration: number;
+	authoritativeObservedAt: number | null;
+	authoritativeComplete: boolean;
+	accounts: RoutingIdentityAccount[];
+}
+
 /** Stored credential pool operations used by the AuthStorage facade. */
 export interface CredentialsApi {
+	/**
+	 * Identity-only view of loaded Anthropic OAuth rows, read synchronously from the pool.
+	 * Never exposes credential material; a namespace-less source yields no accounts.
+	 */
+	routingIdentities(options: { provider: "anthropic" }): RoutingIdentityCatalog;
 	/** Read the current credential snapshot generation. */
 	readonly generation: number;
 	/** Subscribe to credential snapshot generation changes. */

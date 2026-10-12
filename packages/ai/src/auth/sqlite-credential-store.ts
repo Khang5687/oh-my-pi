@@ -23,9 +23,11 @@ import type {
 	AuthCredential,
 	DisabledCredentialSummary,
 	OAuthCredential,
+	RoutingSourceIdentity,
 	StoredAuthCredential,
 	StoredCredentialBlock,
 } from "./types";
+import { isStoreNamespace, ROUTING_SOURCE_UNSUPPORTED } from "./types";
 import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import type {
@@ -442,10 +444,12 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#authRevision: number;
 	#localAuthRevision: number;
 	#closed = false;
+	#routingSource: RoutingSourceIdentity = ROUTING_SOURCE_UNSUPPORTED;
 
 	constructor(db: Database) {
 		this.#db = db;
 		this.#initializeSchema();
+		this.#routingSource = this.#initializeRoutingSource();
 		this.#dataVersion = this.#readDataVersion();
 		this.#authRevision = this.#readAuthRevision();
 		this.#localAuthRevision = this.#readLocalAuthRevision();
@@ -721,6 +725,52 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		if (recordedVersion !== AUTH_SCHEMA_VERSION && schemaVersion <= AUTH_SCHEMA_VERSION) {
 			this.#writeAuthSchemaVersion(AUTH_SCHEMA_VERSION);
 		}
+	}
+
+	/**
+	 * Create-once source namespace. `INSERT OR IGNORE` on the singleton row makes
+	 * concurrent opens converge on the committed value. A stored value that is not
+	 * a lowercase UUIDv4 is never repaired: the source stays unsupported.
+	 */
+	#initializeRoutingSource(): RoutingSourceIdentity {
+		const read = (): unknown => {
+			const select = this.#db.prepare("SELECT store_namespace FROM auth_routing_source_identity WHERE id = 1");
+			try {
+				return (select.get() as { store_namespace?: unknown } | undefined)?.store_namespace;
+			} finally {
+				select.finalize();
+			}
+		};
+		try {
+			this.#db.run(`
+				CREATE TABLE IF NOT EXISTS auth_routing_source_identity (
+					id INTEGER PRIMARY KEY CHECK (id = 1),
+					store_namespace TEXT NOT NULL UNIQUE,
+					created_at INTEGER NOT NULL
+				)
+			`);
+			// Write only when absent: a write on every open would look like an external change to peers.
+			if (read() === undefined) {
+				const insert = this.#db.prepare(
+					"INSERT OR IGNORE INTO auth_routing_source_identity(id, store_namespace, created_at) VALUES (1, ?, ?)",
+				);
+				try {
+					insert.run(crypto.randomUUID(), Date.now());
+				} finally {
+					insert.finalize();
+				}
+			}
+			const namespace = read();
+			if (!isStoreNamespace(namespace)) return ROUTING_SOURCE_UNSUPPORTED;
+			return { status: "supported", storeNamespace: namespace, reason: null };
+		} catch (error) {
+			logger.warn("SqliteAuthCredentialStore routing source identity unavailable", { error: String(error) });
+			return ROUTING_SOURCE_UNSUPPORTED;
+		}
+	}
+
+	routingSourceIdentity(): RoutingSourceIdentity {
+		return this.#routingSource;
 	}
 
 	#authCredentialsTableExists(): boolean {

@@ -36,6 +36,7 @@ import type {
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_SOURCE_IDENTITY_V1,
 	DEFAULT_AUTH_BROKER_BIND,
 	DEFAULT_REFRESH_INTERVAL_MS,
 	DEFAULT_REFRESH_SKEW_MS,
@@ -114,13 +115,27 @@ function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
 	return tokens.has(match[1].trim());
 }
 
-function supportsCodexMeterBlockScopes(req: Request): boolean {
-	const capabilities = req.headers.get(AUTH_BROKER_CAPABILITIES_HEADER);
-	return (
-		capabilities
+/** Optional protocol features one client advertised; each flavour gets its own wire projection. */
+interface ClientFlavour {
+	codexMeterBlockScopes: boolean;
+	sourceIdentity: boolean;
+}
+
+function clientFlavour(req: Request): ClientFlavour {
+	const advertised = new Set(
+		req.headers
+			.get(AUTH_BROKER_CAPABILITIES_HEADER)
 			?.split(",")
-			.some(capability => capability.trim() === AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES) ?? false
+			.map(capability => capability.trim()),
 	);
+	return {
+		codexMeterBlockScopes: advertised.has(AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES),
+		sourceIdentity: advertised.has(AUTH_BROKER_CAPABILITY_SOURCE_IDENTITY_V1),
+	};
+}
+
+function flavourKey(flavour: ClientFlavour): string {
+	return `${flavour.codexMeterBlockScopes ? 1 : 0}${flavour.sourceIdentity ? 1 : 0}`;
 }
 
 /**
@@ -442,26 +457,30 @@ class SnapshotSource {
 	}
 
 	/** Wire snapshot for one client flavour, projected at the current server time. */
-	build(clientSupportsCodexMeterBlockScopes: boolean): SnapshotResponse {
+	build(flavour: ClientFlavour): SnapshotResponse {
 		const rows = this.#currentRows();
 		const serverNowMs = Date.now();
 		const { wire, nextSweepAt } = resolveRefresherSchedule(this.#refresher, serverNowMs);
 		const blocksByCredentialId = buildCredentialBlockGroups(
 			this.#storage.blocks.list(rows.credentials.map(entry => entry.id)),
 			serverNowMs,
-			clientSupportsCodexMeterBlockScopes,
+			flavour.codexMeterBlockScopes,
 		);
 		const credentials: SnapshotEntry[] = rows.credentials.map(entry => {
 			const blocks = blocksByCredentialId.get(entry.id);
 			const rotatesInMs = computeRotatesInMs(entry, wire, nextSweepAt, serverNowMs);
 			return blocks && blocks.length > 0 ? { ...entry, rotatesInMs, blocks } : { ...entry, rotatesInMs };
 		});
+		const { source } = this.#storage.credentials.routingIdentities({ provider: "anthropic" });
+		const storeNamespace =
+			flavour.sourceIdentity && source.status === "supported" ? source.storeNamespace : undefined;
 		return {
 			generation: rows.generation,
 			generatedAt: serverNowMs,
 			serverNowMs,
 			refresher: wire,
 			credentials,
+			...(storeNamespace !== undefined ? { storeNamespace } : {}),
 		};
 	}
 
@@ -482,13 +501,13 @@ async function serveSnapshot(
 	peer: string,
 ): Promise<Response> {
 	await source.reload();
-	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
+	const flavour = clientFlavour(req);
 	let currentGeneration = source.generation;
 	const clientGeneration = parseGenerationTag(req.headers.get("if-none-match"));
 	const waitMs = parseWaitMs(url);
 
 	if (clientGeneration === undefined || currentGeneration !== clientGeneration || waitMs <= 0) {
-		const body = source.build(clientSupportsCodexMeterBlockScopes);
+		const body = source.build(flavour);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
@@ -508,7 +527,7 @@ async function serveSnapshot(
 	await source.reload();
 	currentGeneration = source.generation;
 	if (currentGeneration !== clientGeneration) {
-		const body = source.build(clientSupportsCodexMeterBlockScopes);
+		const body = source.build(flavour);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
 			credentials: body.credentials.length,
@@ -548,7 +567,7 @@ function sseEvent(event: string, body: unknown): Uint8Array {
 /** One open `GET /v1/snapshot/stream` connection, as seen by {@link SnapshotStreamHub}. */
 interface SnapshotStreamSubscriber {
 	readonly peer: string;
-	readonly codexMeterBlockScopes: boolean;
+	readonly flavour: ClientFlavour;
 	/** Fingerprint of the last entry frame sent per credential id. */
 	readonly sent: Map<number, string>;
 	lastGeneration: number;
@@ -578,9 +597,10 @@ class SnapshotStreamFrame {
 	entryEvent(index: number): Uint8Array {
 		const cached = this.#entryEvents[index];
 		if (cached) return cached;
-		const { generation, serverNowMs, refresher, credentials } = this.snapshot;
+		const { generation, serverNowMs, refresher, credentials, storeNamespace } = this.snapshot;
 		const payload: SnapshotStreamEntryEvent = {
 			kind: "entry",
+			...(storeNamespace !== undefined ? { storeNamespace } : {}),
 			generation,
 			serverNowMs,
 			refresher,
@@ -594,8 +614,15 @@ class SnapshotStreamFrame {
 	removedEvent(id: number): Uint8Array {
 		const cached = this.#removedEvents.get(id);
 		if (cached) return cached;
-		const { generation, serverNowMs, refresher } = this.snapshot;
-		const payload: SnapshotStreamRemovedEvent = { kind: "removed", generation, serverNowMs, refresher, id };
+		const { generation, serverNowMs, refresher, storeNamespace } = this.snapshot;
+		const payload: SnapshotStreamRemovedEvent = {
+			kind: "removed",
+			...(storeNamespace !== undefined ? { storeNamespace } : {}),
+			generation,
+			serverNowMs,
+			refresher,
+			id,
+		};
 		const event = sseEvent("removed", payload);
 		this.#removedEvents.set(id, event);
 		return event;
@@ -703,12 +730,13 @@ class SnapshotStreamHub {
 	}
 
 	#fanOut(): void {
-		const frames = new Map<boolean, SnapshotStreamFrame>();
+		const frames = new Map<string, SnapshotStreamFrame>();
 		for (const subscriber of Array.from(this.#subscribers)) {
-			let frame = frames.get(subscriber.codexMeterBlockScopes);
+			const key = flavourKey(subscriber.flavour);
+			let frame = frames.get(key);
 			if (!frame) {
-				frame = new SnapshotStreamFrame(this.#source.build(subscriber.codexMeterBlockScopes));
-				frames.set(subscriber.codexMeterBlockScopes, frame);
+				frame = new SnapshotStreamFrame(this.#source.build(subscriber.flavour));
+				frames.set(key, frame);
 			}
 			deliverStreamFrame(subscriber, frame);
 		}
@@ -762,7 +790,7 @@ function serveSnapshotStream(
 
 	const subscriber: SnapshotStreamSubscriber = {
 		peer,
-		codexMeterBlockScopes: supportsCodexMeterBlockScopes(req),
+		flavour: clientFlavour(req),
 		sent: new Map(),
 		lastGeneration: -1,
 		write,
@@ -772,7 +800,7 @@ function serveSnapshotStream(
 		async start(c) {
 			controller = c;
 			await source.reload();
-			const initial = source.build(subscriber.codexMeterBlockScopes);
+			const initial = source.build(subscriber.flavour);
 			subscriber.lastGeneration = initial.generation;
 			for (const entry of initial.credentials) subscriber.sent.set(entry.id, fingerprintEntry(entry));
 			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };

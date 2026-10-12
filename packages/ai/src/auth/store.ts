@@ -14,6 +14,7 @@ import type {
 	DisabledCredentialSummary,
 	OAuthCredential,
 	OAuthRefreshReason,
+	RoutingSourceIdentity,
 	StoredAuthCredential,
 	StoredCredentialBlock,
 } from "./types";
@@ -35,6 +36,13 @@ export interface CredentialRowStore {
 	/** Record the current auth revision after a local mutation already notified consumers. */
 	acknowledgeLocalChanges?(): void;
 	listAuthCredentials(provider?: string): StoredAuthCredential[];
+	/**
+	 * Opaque namespace that scopes this store's durable row ids. Stores that
+	 * cannot supply one omit the hook and are treated as unsupported.
+	 */
+	routingSourceIdentity?(): RoutingSourceIdentity;
+	/** False when {@link listAuthCredentials} is a filtered view, so absence of a row proves nothing. */
+	routingListingComplete?(): boolean;
 	/**
 	 * Optional store hook to re-hydrate the credential snapshot from its
 	 * backing source. Remote broker stores re-fetch `GET /v1/snapshot` so a
