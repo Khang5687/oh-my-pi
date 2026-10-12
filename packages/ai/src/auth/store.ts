@@ -17,6 +17,7 @@ import type {
 	RoutingSourceIdentity,
 	StoredAuthCredential,
 	StoredCredentialBlock,
+	UsageCachePeekRequest,
 } from "./types";
 
 /** Owner and timestamp that fence a durable credential refresh lease. */
@@ -216,6 +217,11 @@ export interface CredentialUpstream {
 	 * `signal` propagates the agent's cancel down to the broker fetch.
 	 */
 	getUsageReport(provider: Provider, credential: OAuthCredential, signal?: AbortSignal): Promise<UsageReport | null>;
+	/**
+	 * Optional metadata-only peek at the store's already-loaded usage for one native row
+	 * (a remote store's cache/overlay). Must not fetch, refresh or list siblings.
+	 */
+	peekUsageByCredentialId?(request: UsageCachePeekRequest): Readonly<UsageReport> | null;
 	/**
 	 * Optional store hook to ingest a parsed provider usage report for one OAuth
 	 * credential. Remote broker stores use this to overlay header-derived limits

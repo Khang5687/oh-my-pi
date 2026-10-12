@@ -1188,6 +1188,28 @@ Generic `forceRefresh: true` requests do not opt into reuse. Provider-401 retry
 paths pass `refreshReason: "auth-recovery"` explicitly; expiry sentinels and
 usage polling do not imply that reason.
 
+### Claude included-billing observation
+
+Claude usage reports carry `metadata.routingObservation`: whether extra (paid) usage is
+`enabled`, `disabled` or `unknown`, plus the quantitative windows with their source.
+Only a successful JSON body from the canonical `https://api.anthropic.com/api/oauth/usage`
+fetched with an OAuth credential can establish `enabled` or `disabled`. `spend.enabled`
+wins when present; `spend: null` or absent permits the legacy `extra_usage.is_enabled`;
+a present malformed `spend`, disagreeing booleans, disagreeing identity aliases, a custom
+proxy, or header auth give `unknown`. Money fields never decide the state.
+
+An explicit state is admissible while `observedAt <= now < observedAt + 300000`; the
+boundary instant is already `unknown`. The observation time is the parser's injected
+clock, so rate-limit-header merges replace window rows but cannot create or renew billing,
+and a retained last-good report keeps its original time. Check freshness with
+`currentIncludedBilling(billing, nowMs)`.
+
+`authStorage.usage.peekByCredentialId({ provider: "anthropic", credentialId, baseUrl })`
+returns the already-cached report for one native row, bound to the store namespace and row id
+(`null` for an unsupported namespace, missing row, or endpoint or identity mismatch). It
+never fetches or refreshes. `UsageService.refreshRoutingObservation` reads one exact row
+from a fresh full response for a native owner that already selected the credential.
+
 ### Provider Notes
 
 **OpenAI Codex**: Requires a ChatGPT Plus or Pro subscription. Provides access to GPT-5.x Codex models with extended context windows and reasoning capabilities. The library automatically handles session-based prompt caching when `sessionId` is provided in stream options.

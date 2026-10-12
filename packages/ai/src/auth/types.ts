@@ -1252,6 +1252,13 @@ export interface SessionsApi {
 	release(provider: string, sessionId: string): boolean;
 }
 
+/** Exact-row cache peek input for {@link UsageApi.peekByCredentialId}. */
+export interface UsageCachePeekRequest {
+	provider: "anthropic";
+	credentialId: number;
+	baseUrl: string;
+}
+
 /** Usage reporting, observation, and provider configuration. */
 export interface UsageApi {
 	/** Fetch aggregate usage reports for configured providers. */
@@ -1259,6 +1266,12 @@ export interface UsageApi {
 		baseUrlResolver?: (provider: Provider) => string | undefined;
 		signal?: AbortSignal;
 	}): Promise<UsageReport[] | null>;
+	/**
+	 * Already-loaded usage for one native Anthropic row, bound to its source and row id.
+	 * Reads only the local cache or store overlay; never fetches, refreshes or lists siblings.
+	 * Null for a missing hook, row, namespace, or identity/endpoint mismatch.
+	 */
+	peekByCredentialId(request: UsageCachePeekRequest): Readonly<UsageReport> | null;
 	/** Ingest provider usage limits from response headers. */
 	ingestHeaders(
 		provider: Provider,

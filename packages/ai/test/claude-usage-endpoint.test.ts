@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
-import type { UsageFetchContext } from "@oh-my-pi/pi-ai/usage";
+import type { RoutingObservation, UsageFetchContext, UsageFetchParams } from "@oh-my-pi/pi-ai/usage";
 import { claudeUsageProvider } from "@oh-my-pi/pi-ai/usage/claude";
 
 const CANONICAL_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
@@ -188,5 +188,131 @@ describe("claudeUsageProvider usage endpoint resolution", () => {
 		// the generic transient classification.
 		expect(plainUsageUrls(urls)).toEqual(["https://gateway.example.com/api/oauth/usage", CANONICAL_USAGE_URL]);
 		expect(report?.metadata?.endpoint).toBe(CANONICAL_USAGE_URL);
+	});
+});
+
+describe("claudeUsageProvider included-billing observation", () => {
+	const NOW = 1_800_000_000_000;
+	const FIVE_HOUR = { utilization: 17, resets_at: new Date(NOW + 60 * 60_000).toISOString() };
+
+	async function observe(payload: Record<string, unknown>, extra?: Partial<UsageFetchParams>) {
+		const { fetch } = recordingFetch(url =>
+			url.endsWith("/api/oauth/usage") ? jsonResponse(200, payload) : jsonResponse(404, { error: "not_found" }),
+		);
+		const report = await claudeUsageProvider.fetchUsage(
+			{ ...params(), ...extra, nowMs: NOW } as UsageFetchParams,
+			context(fetch),
+		);
+		const observation = report?.metadata?.routingObservation as RoutingObservation | undefined;
+		return { report, observation };
+	}
+
+	it("reads explicit spend.enabled true and false from the full response, independent of money fields", async () => {
+		const off = await observe({ five_hour: FIVE_HOUR, spend: { enabled: false, used: "garbage" } });
+		expect(off.observation?.billing).toEqual({
+			state: "disabled",
+			observedAt: NOW,
+			validUntil: NOW + 300_000,
+			source: "claude-usage-spend",
+			sourceRevision: null,
+		});
+		const on = await observe({ five_hour: FIVE_HOUR, spend: { enabled: true, used: { amount_minor: -1 } } });
+		expect(on.observation?.billing.state).toBe("enabled");
+		expect(on.observation?.billing.observedAt).toBe(NOW);
+	});
+
+	it("falls back to the legacy boolean only when spend is null or absent", async () => {
+		for (const spend of [null, undefined]) {
+			const off = await observe({ five_hour: FIVE_HOUR, spend, extra_usage: { is_enabled: false } });
+			expect(off.observation?.billing).toMatchObject({ state: "disabled", source: "claude-usage-legacy" });
+			const on = await observe({ five_hour: FIVE_HOUR, spend, extra_usage: { is_enabled: true } });
+			expect(on.observation?.billing).toMatchObject({ state: "enabled", source: "claude-usage-legacy" });
+		}
+	});
+
+	it("treats missing, malformed and conflicting state as unknown", async () => {
+		const cases: Array<[Record<string, unknown>, string]> = [
+			[{}, "no_evidence"],
+			[{ extra_usage: {} }, "no_evidence"],
+			[{ spend: {}, extra_usage: { is_enabled: false } }, "malformed"],
+			[{ spend: "off", extra_usage: { is_enabled: false } }, "malformed"],
+			[{ spend: { enabled: "false" } }, "malformed"],
+			[{ extra_usage: { is_enabled: "yes" } }, "malformed"],
+			[{ spend: { enabled: false }, extra_usage: { is_enabled: "no" } }, "malformed"],
+			[{ spend: { enabled: false }, extra_usage: { is_enabled: true } }, "conflict"],
+			[{ spend: { enabled: true }, extra_usage: { is_enabled: false } }, "conflict"],
+		];
+		for (const [fields, reason] of cases) {
+			const { report, observation } = await observe({ five_hour: FIVE_HOUR, ...fields });
+			expect(report).not.toBeNull();
+			expect(observation?.billing).toMatchObject({ state: "unknown", observedAt: null, validUntil: null, reason });
+		}
+		const agree = await observe({
+			five_hour: FIVE_HOUR,
+			spend: { enabled: false },
+			extra_usage: { is_enabled: false },
+		});
+		expect(agree.observation?.billing).toMatchObject({ state: "disabled", source: "claude-usage-spend" });
+	});
+
+	it("produces a billing-only report when no quantitative row parses", async () => {
+		const { report, observation } = await observe({ spend: { enabled: false } });
+		expect(report?.limits).toEqual([]);
+		expect(observation?.billing.state).toBe("disabled");
+		expect(observation?.windowObservations).toEqual([]);
+	});
+
+	it("rejects untrusted endpoints and header-auth credentials", async () => {
+		const proxy = await observe(
+			{ five_hour: FIVE_HOUR, spend: { enabled: false } },
+			params("https://gateway.example.com/v1"),
+		);
+		expect(proxy.report?.metadata?.endpoint).toBe("https://gateway.example.com/api/oauth/usage");
+		expect(proxy.observation?.billing).toMatchObject({ state: "unknown", reason: "untrusted_source" });
+		const headerAuth = await observe(
+			{ five_hour: FIVE_HOUR, spend: { enabled: false } },
+			{ credential: { type: "api_key", apiKey: "sk-ant-oat01-test" } },
+		);
+		expect(headerAuth.observation?.billing).toMatchObject({ state: "unknown", reason: "untrusted_source" });
+	});
+
+	it("compares every identity alias with each other and with the request identity", async () => {
+		const base = { five_hour: FIVE_HOUR, spend: { enabled: false } };
+		const agreeing = await observe({
+			...base,
+			account_id: "account_test",
+			user: { id: "account_test" },
+			email: "USER@example.com",
+		});
+		expect(agreeing.observation?.billing.state).toBe("disabled");
+		expect(agreeing.observation?.accountId).toBe("account_test");
+		const aliasConflict = await observe({ ...base, account_id: "account_test", user: { id: "someone_else" } });
+		expect(aliasConflict.observation?.billing).toMatchObject({ state: "unknown", reason: "conflict" });
+		const requestMismatch = await observe({ ...base, account: { uuid: "other_account" } });
+		expect(requestMismatch.observation?.billing).toMatchObject({ state: "unknown", reason: "identity_mismatch" });
+		const emailMismatch = await observe({ ...base, email: "other@example.com" });
+		expect(emailMismatch.observation?.billing).toMatchObject({ state: "unknown", reason: "identity_mismatch" });
+		const orgMismatch = await observe(
+			{ ...base, organization_id: "org_b" },
+			{ credential: { ...params().credential, orgId: "org_a" } },
+		);
+		expect(orgMismatch.observation?.billing).toMatchObject({ state: "unknown", reason: "identity_mismatch" });
+	});
+
+	it("projects quantitative windows with full-response source and reset-bounded expiry", async () => {
+		const resetAt = NOW + 60 * 60_000;
+		const { observation } = await observe({ five_hour: FIVE_HOUR, spend: { enabled: false, used: null } });
+		expect(observation?.windowObservations).toEqual([
+			{
+				id: "anthropic:5h",
+				label: "Claude 5 Hour",
+				scope: { kind: "shared" },
+				usedFraction: 0.17,
+				resetAt,
+				observedAt: NOW,
+				validUntil: NOW + 300_000,
+				source: "usage-full",
+			},
+		]);
 	});
 });

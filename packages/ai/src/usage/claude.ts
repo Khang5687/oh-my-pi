@@ -4,6 +4,10 @@ import * as AIError from "../error";
 import {
 	type CredentialRankingContext,
 	type CredentialRankingStrategy,
+	type IncludedBillingState,
+	ROUTING_BILLING_MAX_AGE_MS,
+	type RoutingObservation,
+	type RoutingWindow,
 	resolveUsedFraction,
 	type UsageAmount,
 	type UsageCredential,
@@ -13,10 +17,12 @@ import {
 	type UsageProvider,
 	type UsageReport,
 	type UsageWindow,
+	unknownBilling,
+	readRoutingObservation,
 } from "../usage";
 import { isRecord } from "../utils";
 import { waitForRetry } from "../utils/retry-wait";
-import { buildClaudeOAuthHeaders, claudeOAuthBaseUrls } from "./claude-api";
+import { buildClaudeOAuthHeaders, claudeOAuthBaseUrls, DEFAULT_CLAUDE_OAUTH_BASE_URL } from "./claude-api";
 import { listClaudeResetCredits, parseClaudeResetCreditsFromUsagePayload } from "./claude-reset";
 import { HOUR_MS, parseIsoTimestamp, usageStatus, WEEK_MS } from "./shared";
 
@@ -195,6 +201,161 @@ function extractUsageIdentity(payload: ClaudeUsageResponse): { accountId?: strin
 	return { accountId, email };
 }
 
+type BillingFlag =
+	| { state: "enabled" | "disabled"; source: "claude-usage-spend" | "claude-usage-legacy" }
+	| { state: "unknown"; reason: "no_evidence" | "malformed" | "conflict" };
+
+/**
+ * Read the explicit included-billing boolean. Null/absent `spend` means the
+ * newer field is absent and permits the legacy boolean; a present malformed
+ * `spend` is unknown and never falls back. When both carry booleans they must
+ * agree. Monetary counters are never consulted.
+ */
+function parseBillingFlag(payload: ClaudeUsageResponse): BillingFlag {
+	let spendFlag: boolean | undefined;
+	if (payload.spend !== null && payload.spend !== undefined) {
+		const spend: unknown = payload.spend;
+		if (!isRecord(spend) || typeof spend.enabled !== "boolean") return { state: "unknown", reason: "malformed" };
+		spendFlag = spend.enabled;
+	}
+	let legacyFlag: boolean | undefined;
+	const legacy: unknown = payload.extra_usage;
+	if (legacy !== null && legacy !== undefined) {
+		if (!isRecord(legacy)) return { state: "unknown", reason: "malformed" };
+		const flag = legacy.is_enabled;
+		if (flag !== null && flag !== undefined) {
+			if (typeof flag !== "boolean") return { state: "unknown", reason: "malformed" };
+			legacyFlag = flag;
+		}
+	}
+	if (spendFlag !== undefined && legacyFlag !== undefined && spendFlag !== legacyFlag) {
+		return { state: "unknown", reason: "conflict" };
+	}
+	if (spendFlag !== undefined) return { state: spendFlag ? "enabled" : "disabled", source: "claude-usage-spend" };
+	if (legacyFlag !== undefined) return { state: legacyFlag ? "enabled" : "disabled", source: "claude-usage-legacy" };
+	return { state: "unknown", reason: "no_evidence" };
+}
+
+/** Every distinct, normalized value a response carries under the given identity aliases. */
+function collectAliases(payload: ClaudeUsageResponse, aliases: ReadonlyArray<string | readonly [string, string]>) {
+	const values = new Set<string>();
+	for (const alias of aliases) {
+		const value =
+			typeof alias === "string"
+				? getPayloadString(payload as Record<string, unknown>, alias)
+				: getNestedPayloadString(payload as Record<string, unknown>, alias[0], alias[1]);
+		if (value !== undefined) values.add(value);
+	}
+	return values;
+}
+
+const ACCOUNT_ID_ALIASES = [
+	"account_id",
+	"accountId",
+	"user_id",
+	"userId",
+	["account", "uuid"],
+	["account", "id"],
+	["user", "uuid"],
+	["user", "id"],
+] as const;
+const EMAIL_ALIASES = ["email", "user_email", "userEmail", ["account", "email"], ["user", "email"]] as const;
+const ORG_ID_ALIASES = [
+	"organization_id",
+	"organizationId",
+	"org_id",
+	"orgId",
+	["organization", "uuid"],
+	["organization", "id"],
+] as const;
+
+interface ResponseIdentity {
+	accountId: string | null;
+	organizationId: string | null;
+	/** True when aliases disagree with each other or with the request's native identity. */
+	mismatch: "conflict" | "identity_mismatch" | null;
+}
+
+/** Compare every present response alias with each other and with the authenticated request's identity. */
+function checkResponseIdentity(
+	payload: ClaudeUsageResponse,
+	expected: { accountId?: string; email?: string; orgId?: string },
+): ResponseIdentity {
+	const accounts = collectAliases(payload, ACCOUNT_ID_ALIASES);
+	const emails = new Set([...collectAliases(payload, EMAIL_ALIASES)].map(email => email.toLowerCase()));
+	const orgs = collectAliases(payload, ORG_ID_ALIASES);
+	const accountId = accounts.size === 1 ? [...accounts][0] : null;
+	const organizationId = orgs.size === 1 ? [...orgs][0] : null;
+	if (accounts.size > 1 || emails.size > 1 || orgs.size > 1)
+		return { accountId, organizationId, mismatch: "conflict" };
+	const expectedEmail = expected.email?.trim().toLowerCase();
+	const expectedAccount = expected.accountId?.trim();
+	const expectedOrg = expected.orgId?.trim();
+	if (
+		(accountId !== null && expectedAccount && accountId !== expectedAccount) ||
+		(emails.size === 1 && expectedEmail && !emails.has(expectedEmail)) ||
+		(organizationId !== null && expectedOrg && organizationId !== expectedOrg)
+	) {
+		return { accountId, organizationId, mismatch: "identity_mismatch" };
+	}
+	return { accountId, organizationId, mismatch: null };
+}
+
+/** Whether `endpoint` is the canonical first-party full usage endpoint. */
+function isTrustedUsageEndpoint(endpoint: string | undefined): boolean {
+	return endpoint === `${DEFAULT_CLAUDE_OAUTH_BASE_URL}/usage`;
+}
+
+function buildClaudeBilling(
+	flag: BillingFlag,
+	identity: ResponseIdentity,
+	endpoint: string | undefined,
+	nowMs: number,
+): IncludedBillingState {
+	if (flag.state === "unknown") return unknownBilling(flag.reason);
+	if (!isTrustedUsageEndpoint(endpoint)) return unknownBilling("untrusted_source");
+	if (identity.mismatch) return unknownBilling(identity.mismatch);
+	if (!Number.isFinite(nowMs) || nowMs <= 0) return unknownBilling("invalid_observation");
+	return {
+		state: flag.state,
+		observedAt: nowMs,
+		validUntil: nowMs + ROUTING_BILLING_MAX_AGE_MS,
+		source: flag.source,
+		sourceRevision: null,
+	};
+}
+
+/** Project quantitative windows (never the extra-usage row) with the source that observed them. */
+function routingWindowsFromLimits(
+	limits: readonly UsageLimit[],
+	observedAt: number,
+	source: "usage-full" | "usage-header",
+): RoutingWindow[] {
+	const windows: RoutingWindow[] = [];
+	for (const limit of limits) {
+		if (limit.id === "anthropic:extra") continue;
+		const fraction = resolveUsedFraction(limit);
+		const resetAt = limit.window?.resetsAt;
+		const validReset = typeof resetAt === "number" && Number.isFinite(resetAt) ? resetAt : null;
+		const expiry = observedAt + ROUTING_BILLING_MAX_AGE_MS;
+		windows.push({
+			id: limit.id,
+			label: limit.label,
+			scope:
+				limit.scope.shared === true
+					? { kind: "shared" }
+					: { kind: "family", family: limit.scope.tier ?? limit.scope.windowId ?? limit.id },
+			usedFraction:
+				typeof fraction === "number" && Number.isFinite(fraction) ? Math.min(Math.max(fraction, 0), 1) : null,
+			resetAt: validReset,
+			observedAt,
+			validUntil: validReset === null ? expiry : Math.min(expiry, validReset),
+			source,
+		});
+	}
+	return windows;
+}
+
 function hasUsageData(payload: ClaudeUsageResponse): boolean {
 	return (
 		parseBucket(payload.five_hour)?.utilization !== undefined ||
@@ -203,6 +364,7 @@ function hasUsageData(payload: ClaudeUsageResponse): boolean {
 		parseBucket(payload.seven_day_sonnet)?.utilization !== undefined ||
 		parseApiLimitEntries(payload.limits).some(entry => entry.bucket.utilization !== undefined) ||
 		buildClaudeExtraUsageLimit(payload) !== null ||
+		parseBillingFlag(payload).state !== "unknown" ||
 		parseClaudeResetCreditsFromUsagePayload(payload) !== null
 	);
 }
@@ -620,11 +782,20 @@ export function parseClaudeRateLimitHeaders(headers: Record<string, string>, now
 	].filter((limit): limit is UsageLimit => limit !== null);
 
 	if (limits.length === 0) return null;
+	const routingObservation: RoutingObservation = {
+		storeNamespace: null,
+		nativeRowId: null,
+		accountId: null,
+		organizationId: null,
+		endpoint: null,
+		billing: unknownBilling("no_evidence"),
+		windowObservations: routingWindowsFromLimits(limits, now, "usage-header"),
+	};
 	return {
 		provider: "anthropic",
 		fetchedAt: now,
 		limits,
-		metadata: { source: "ratelimit-headers" },
+		metadata: { source: "ratelimit-headers", routingObservation },
 	};
 }
 
@@ -665,7 +836,12 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 		if (!result.endpointAbsent) break;
 	}
 	if (!payload || baseUrl === undefined) return null;
-	const report = parseClaudeUsagePayload(payload, credential, `${baseUrl}/usage`);
+	const report = parseClaudeUsagePayload(payload, credential, `${baseUrl}/usage`, params.nowMs ?? Date.now());
+	// Header-auth (API-key slot carrying an OAuth token) is never first-party billing evidence.
+	const observation = readRoutingObservation(report);
+	if (report && observation && credential.type !== "oauth") {
+		observation.billing = unknownBilling("untrusted_source");
+	}
 	const resetCreditList =
 		parseClaudeResetCreditsFromUsagePayload(payload, credential.orgId, baseUrl) ??
 		(await listClaudeResetCredits({
@@ -685,7 +861,7 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 	if (!report && !hasResetInventory) return null;
 	const result: UsageReport = report ?? {
 		provider: "anthropic",
-		fetchedAt: Date.now(),
+		fetchedAt: params.nowMs ?? Date.now(),
 		limits: [],
 		metadata: { endpoint: `${baseUrl}/usage`, ...extractUsageIdentity(payload) },
 		raw: payload,
@@ -777,7 +953,19 @@ export function parseClaudeUsagePayload(
 		buildClaudeExtraUsageLimit(payload),
 	].filter((limit): limit is UsageLimit => limit !== null);
 
-	if (limits.length === 0) return null;
+	const responseIdentity = checkResponseIdentity(payload, identity);
+	const billing = buildClaudeBilling(parseBillingFlag(payload), responseIdentity, endpoint, fetchedAt);
+	// A valid explicit billing object is a report on its own, even with no quantitative row.
+	if (limits.length === 0 && billing.state === "unknown") return null;
+	const routingObservation: RoutingObservation = {
+		storeNamespace: null,
+		nativeRowId: null,
+		accountId: responseIdentity.accountId,
+		organizationId: responseIdentity.organizationId,
+		endpoint: endpoint ?? null,
+		billing,
+		windowObservations: routingWindowsFromLimits(limits, fetchedAt, "usage-full"),
+	};
 	// The response speaks for the token that fetched it; stored metadata may be stale.
 	const payloadIdentity = extractUsageIdentity(payload);
 	const accountId = payloadIdentity.accountId ?? identity.accountId;
@@ -791,6 +979,7 @@ export function parseClaudeUsagePayload(
 			...(accountId ? { accountId } : {}),
 			...(email ? { email } : {}),
 			...(identity.orgId ? { orgId: identity.orgId } : {}),
+			routingObservation,
 		},
 		raw: payload,
 	};
@@ -802,7 +991,8 @@ export const claudeUsageProvider: UsageProvider = {
 	// account email stop sharing a slot. v3 retires parsed reports created before
 	// Anthropic extra-usage rows existed; header ingestion can otherwise keep
 	// renewing those incomplete reports throughout the 24h last-good retention.
-	cacheVersion: 3,
+	// v4 retires reports cached before the routing observation projection existed.
+	cacheVersion: 4,
 	failureBackoffMs: FAILURE_BACKOFF_MS,
 	fetchUsage: fetchClaudeUsage,
 	parseRateLimitHeaders: parseClaudeRateLimitHeaders,
