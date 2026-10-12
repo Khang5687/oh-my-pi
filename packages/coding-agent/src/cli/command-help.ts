@@ -1,5 +1,12 @@
 import type { CommandMetadata } from "@oh-my-pi/pi-utils/cli";
 
+export const accountRoutingCapabilitiesHelp = {
+	description: "Print managed account-routing capabilities as JSON (no auth, network or model startup)",
+	flags: {
+		mode: { kind: "string", description: "Probe mode: model (default) or metadata" },
+	},
+} satisfies CommandMetadata;
+
 export const acpHelp = {
 	description: "Run omp as an ACP (Agent Client Protocol) server over stdio",
 } satisfies CommandMetadata;

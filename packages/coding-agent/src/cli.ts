@@ -28,6 +28,7 @@ import {
 } from "@oh-my-pi/pi-utils/dirs";
 
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
+import { runAccountRoutingCapabilities } from "./cli/account-routing-capabilities-cli";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
 import {
 	BLOB_BROKER_WORKER_ARG,
@@ -436,6 +437,12 @@ async function runTinyWorker(): Promise<void> {
 	await startTinyWorkerFromEnvironment();
 }
 
+const ACCOUNT_ROUTING_CAPABILITIES_COMMAND = "account-routing-capabilities";
+
+function isHelpRequest(args: readonly string[]): boolean {
+	return args.includes("--help") || args.includes("-h");
+}
+
 /** Resolved top-level command name (never its arguments), for the unsettled-entry report. */
 let runningCommand: string | undefined;
 
@@ -518,6 +525,14 @@ export async function runCli(argv: string[]): Promise<void> {
 		process.stdout.write(formatLicenseOutput());
 		return;
 	}
+	if (resolvedArgv[0] === ACCOUNT_ROUTING_CAPABILITIES_COMMAND && !isHelpRequest(resolvedArgv.slice(1))) {
+		// Static probe: answer before network bootstrap, settings, auth or model startup.
+		process.exitCode = runAccountRoutingCapabilities(resolvedArgv.slice(1), VERSION || null, {
+			stdout: text => void process.stdout.write(text),
+			stderr: text => void process.stderr.write(text),
+		});
+		return;
+	}
 	let stopStartupComposer: (() => void) | undefined;
 	if (
 		!process.env.PI_TIMING &&
@@ -542,7 +557,12 @@ export async function runCli(argv: string[]): Promise<void> {
 		resolvedArgv[0] === "--version" ||
 		resolvedArgv[0] === "-v" ||
 		resolvedArgv[0] === "help";
-	await Promise.all([setFullProcessName(), helpOrVersion ? Promise.resolve() : installNetworkBootstrap()]);
+	await Promise.all([
+		setFullProcessName(),
+		helpOrVersion || resolvedArgv[0] === ACCOUNT_ROUTING_CAPABILITIES_COMMAND
+			? Promise.resolve()
+			: installNetworkBootstrap(),
+	]);
 
 	if (resolvedArgv[0] === "--smoke-test") {
 		await runSmokeTest();
