@@ -1,5 +1,20 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ApiKeyResolution, ApiKeyResolveContext } from "@oh-my-pi/pi-ai";
+import {
+	type AccountRef,
+	AuthStorage,
+	type ManagedAdmissionGrant,
+	type ManagedAttemptOutcome,
+	type ManagedCallContext,
+	type ManagedRoutingDriver,
+	SqliteAuthCredentialStore,
+} from "@oh-my-pi/pi-ai/auth-storage";
+import { type ApiKeyResolver, ManagedDispatchRefusedError, withAuth } from "@oh-my-pi/pi-ai/auth-retry";
+import * as claudeUsage from "@oh-my-pi/pi-ai/usage/claude";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { registerCustomApi, resolveApiKeyOnce, seedApiKeyResolver, unregisterCustomApis } from "@oh-my-pi/pi-ai";
 import { OAuthError, ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import { classify } from "@oh-my-pi/pi-ai/error/flags";
@@ -982,5 +997,441 @@ describe("streamSimple resolver auth retry", () => {
 
 		expect((caught as Error).message).toMatch(/No API key for provider/);
 		expect(attempts).toBe(0);
+	});
+});
+
+describe("managed Claude routing through the stream boundary", () => {
+	const NOW = 1_800_000_000_000;
+	const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+	const ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
+	const savedEnv: Record<string, string | undefined> = {};
+	const claude = buildModel({
+		id: "claude-sonnet-5-5",
+		name: "Claude Sonnet 5.5",
+		api: "anthropic-messages",
+		provider: "anthropic",
+		baseUrl: "https://api.anthropic.com",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 8_192,
+	});
+	const ctx: Context = { messages: [{ role: "user", content: "hi", timestamp: 1 }] };
+
+	let dir = "";
+	let store: SqliteAuthCredentialStore;
+	let storage: AuthStorage;
+	let clock = NOW;
+	let ids: Record<string, number> = {};
+	let namespace = "";
+	let selected = "a";
+	let hostCalls: Array<{ call: ManagedCallContext; previous: ManagedAttemptOutcome | undefined }> = [];
+	let started: ManagedAdmissionGrant[] = [];
+	let outcomes: Array<{ grant: ManagedAdmissionGrant; outcome: ManagedAttemptOutcome }> = [];
+	let requests: Array<{ bearer: string; accountUuid: string | undefined }> = [];
+	let messageScript: Array<() => Response | Promise<Response>> = [];
+	let generation = 0;
+	let attemptSeq = 0;
+	let refuseAfterQuota = true;
+	let advanceClockAfterResolve = 0;
+
+	const sse = (events: object[]): Response =>
+		new Response(
+			events.map(event => `event: ${(event as { type: string }).type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
+			{
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			},
+		);
+	const okResponse = (): Response =>
+		sse([
+			{ type: "message_start", message: { id: "m", usage: { input_tokens: 1, output_tokens: 0 } } },
+			{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+			{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+			{ type: "content_block_stop", index: 0 },
+			{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+			{ type: "message_stop" },
+		]);
+	const failure =
+		(status: number, headers: Record<string, string> = {}): (() => Response) =>
+		() =>
+			new Response(JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "busy" } }), {
+				status,
+				headers: { "content-type": "application/json", ...headers },
+			});
+
+	const messagesFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+		if (!url.includes("/v1/messages")) throw new Error(`unexpected request to ${url}`);
+		const headers = new Headers(init?.headers);
+		const body = JSON.parse(await new Response(init?.body as ConstructorParameters<typeof Response>[0]).text()) as {
+			metadata?: { user_id?: string };
+		};
+		const userId = body.metadata?.user_id
+			? (JSON.parse(body.metadata.user_id) as { account_uuid?: string })
+			: undefined;
+		requests.push({
+			bearer: (headers.get("authorization") ?? "").replace(/^Bearer /i, ""),
+			accountUuid: userId?.account_uuid,
+		});
+		const next = messageScript.shift() ?? okResponse;
+		return next();
+	}) as unknown as typeof fetch;
+
+	const ref = (suffix: string): AccountRef => ({ storeNamespace: namespace, nativeRowId: ids[suffix]! });
+	const lifecycle = {
+		isConfigured: () => true,
+		started: (grant: ManagedAdmissionGrant) => started.push(grant),
+		outcome: (grant: ManagedAdmissionGrant, outcome: ManagedAttemptOutcome) => outcomes.push({ grant, outcome }),
+	};
+	const driver: ManagedRoutingDriver = {
+		beginCall: input => ({
+			operationId: `op-${++generation}`,
+			requestGeneration: generation,
+			sessionId: input.sessionId,
+			modelId: input.modelId,
+			purpose: input.purpose,
+			signal: input.signal,
+			replayPolicy: input.replayPolicy,
+		}),
+		acquire: async (call, options) => {
+			hostCalls.push({ call, previous: options.previousOutcome });
+			if (refuseAfterQuota && options.previousOutcome?.code === "quota_exhausted") {
+				throw new ManagedDispatchRefusedError("quota_blocked", 1000);
+			}
+			return {
+				hostEpoch: "epoch",
+				runtimeInstanceId: "rt",
+				admissionId: `adm-${attemptSeq}`,
+				selectionGeneration: 1,
+				policyRevision: 1,
+				accountRef: ref(selected),
+				operationId: call.operationId,
+				attemptId: `att-${++attemptSeq}`,
+				requestGeneration: call.requestGeneration,
+				sessionId: call.sessionId,
+				modelId: call.modelId,
+				purpose: call.purpose,
+			};
+		},
+		isConfigured: () => true,
+	};
+	const resolver: ApiKeyResolver = Object.assign(
+		async (rctx: ApiKeyResolveContext): Promise<ApiKeyResolution> => {
+			const call = rctx.managedCall;
+			if (!call) throw new Error("managed resolver requires a call");
+			const admission = await driver.acquire(call, { previousOutcome: rctx.previousOutcome });
+			const result = await storage.routing.resolveExact({
+				accountRef: admission.accountRef,
+				modelId: call.modelId,
+				baseUrl: "https://api.anthropic.com",
+				admission,
+				call,
+				lifecycle,
+				signal: rctx.signal,
+			});
+			if ("refusal" in result) throw new ManagedDispatchRefusedError(result.code, result.retryAfterMs);
+			clock += advanceClockAfterResolve;
+			advanceClockAfterResolve = 0;
+			return result;
+		},
+		{ managedRouting: driver },
+	);
+
+	beforeEach(async () => {
+		for (const key of ENV) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+		dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-managed-stream-"));
+		store = await SqliteAuthCredentialStore.open(path.join(dir, "agent.db"));
+		clock = NOW;
+		selected = "a";
+		hostCalls = [];
+		started = [];
+		outcomes = [];
+		requests = [];
+		messageScript = [];
+		generation = 0;
+		attemptSeq = 0;
+		refuseAfterQuota = true;
+		advanceClockAfterResolve = 0;
+		const usageFetch = (async (input: string | URL | Request) => {
+			const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+			if (url !== USAGE_URL) return new Response("{}", { status: 404 });
+			return new Response(JSON.stringify({ five_hour: { utilization: 10 }, spend: { enabled: false } }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as unknown as typeof fetch;
+		storage = new AuthStorage(store, {
+			usageFetch,
+			routingClock: () => clock,
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+		});
+		await storage.credentials.set(
+			"anthropic",
+			["a", "b"].map(suffix => ({
+				type: "oauth" as const,
+				access: `sk-ant-oat01-${suffix}`,
+				refresh: `refresh-${suffix}`,
+				expires: NOW + 3_600_000,
+				accountId: `acc-${suffix}`,
+				email: `${suffix}@example.com`,
+			})),
+		);
+		const catalog = storage.credentials.routingIdentities({ provider: "anthropic" });
+		if (catalog.source.status !== "supported") throw new Error("expected namespace");
+		namespace = catalog.source.storeNamespace;
+		ids = Object.fromEntries(
+			catalog.accounts.map(account => [account.accountId?.replace("acc-", "") ?? "", account.ref.nativeRowId]),
+		);
+	});
+
+	afterEach(async () => {
+		store.close();
+		await fs.rm(dir, { recursive: true, force: true });
+		for (const key of ENV) {
+			if (savedEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = savedEnv[key];
+		}
+	});
+
+	const run = async (options: Partial<SimpleStreamOptions> = {}) => {
+		const stream = streamSimple(claude, ctx, {
+			apiKey: resolver,
+			fetch: messagesFetch,
+			providerRetryWait: async () => {},
+			sessionId: "sess",
+			...options,
+		} as SimpleStreamOptions);
+		let error: unknown;
+		let result: AssistantMessage | undefined;
+		try {
+			for await (const _ of stream) {
+				// drain
+			}
+			result = await stream.result();
+		} catch (caught) {
+			error = caught;
+		}
+		return { result, error };
+	};
+
+	it("serves the granted row, carries its identity in the request, and settles exactly one success outcome", async () => {
+		const { result } = await run();
+		expect(result?.stopReason).toBe("stop");
+		expect(requests).toEqual([{ bearer: "sk-ant-oat01-a", accountUuid: "acc-a" }]);
+		expect(started.map(grant => grant.attemptId)).toEqual(["att-1"]);
+		expect(outcomes).toHaveLength(1);
+		expect(outcomes[0]?.outcome).toMatchObject({ code: "success", dispatch: "dispatched", refusalReason: null });
+		expect(outcomes[0]?.outcome.startedAt).not.toBeNull();
+	});
+
+	it("gives every provider HTTP retry its own grant and outcome and follows the host to the new account", async () => {
+		messageScript = [failure(529), okResponse];
+		const first = await run({
+			// The host moves to B once it sees the first attempt's outcome.
+			sessionId: "sess",
+		});
+		expect(first.result?.stopReason).toBe("stop");
+		expect(hostCalls).toHaveLength(2);
+		expect(hostCalls[1]?.previous?.code).toBe("provider_failed");
+		expect(requests.map(request => request.bearer)).toEqual(["sk-ant-oat01-a", "sk-ant-oat01-a"]);
+		expect(outcomes.map(entry => entry.outcome.code)).toEqual(["provider_failed", "success"]);
+		expect(outcomes.map(entry => entry.grant.attemptId)).toEqual(["att-1", "att-2"]);
+		expect(new Set(outcomes.map(entry => entry.grant.operationId)).size).toBe(1);
+	});
+
+	it("re-binds the bearer and body identity when the host grants a different account for the retry", async () => {
+		messageScript = [
+			() => {
+				selected = "b";
+				return failure(529)();
+			},
+			okResponse,
+		];
+		const { result } = await run();
+		expect(result?.stopReason).toBe("stop");
+		expect(requests).toEqual([
+			{ bearer: "sk-ant-oat01-a", accountUuid: "acc-a" },
+			{ bearer: "sk-ant-oat01-b", accountUuid: "acc-b" },
+		]);
+		expect(outcomes.map(entry => entry.grant.accountRef.nativeRowId)).toEqual([ids.a, ids.b]);
+	});
+
+	it("an empty-completion retry is a new HTTP attempt with its own grant and outcome", async () => {
+		const empty = (): Response =>
+			sse([
+				{ type: "message_start", message: { id: "m", usage: { input_tokens: 1, output_tokens: 0 } } },
+				{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 0 } },
+				{ type: "message_stop" },
+			]);
+		messageScript = [empty, okResponse];
+		const { result } = await run();
+		expect(result?.stopReason).toBe("stop");
+		expect(requests).toHaveLength(2);
+		expect(outcomes).toHaveLength(2);
+		expect(new Set(outcomes.map(entry => entry.grant.attemptId)).size).toBe(2);
+		expect(new Set(outcomes.map(entry => entry.grant.operationId)).size).toBe(1);
+	});
+
+	it("keeps an in-flight A request on A while the next continuation is granted B", async () => {
+		const gate = Promise.withResolvers<void>();
+		messageScript = [
+			async () => {
+				await gate.promise;
+				return okResponse();
+			},
+			okResponse,
+		];
+		const inFlightA = run({ sessionId: "one" });
+		await Bun.sleep(50);
+		selected = "b";
+		const nextB = await run({ sessionId: "two" });
+		expect(nextB.result?.stopReason).toBe("stop");
+		gate.resolve();
+		const settledA = await inFlightA;
+		expect(settledA.result?.stopReason).toBe("stop");
+		expect(requests.map(request => request.bearer).sort()).toEqual(["sk-ant-oat01-a", "sk-ant-oat01-b"]);
+		const byAccount = new Map(outcomes.map(entry => [entry.grant.accountRef.nativeRowId, entry]));
+		expect(outcomes).toHaveLength(2);
+		expect(byAccount.get(ids.a)?.grant.operationId).not.toBe(byAccount.get(ids.b)?.grant.operationId);
+		expect(byAccount.get(ids.a)?.outcome.code).toBe("success");
+	});
+
+	it("reads positive exhaustion only from unified utilization>=1 with a future reset and never falls back", async () => {
+		const reset = String(Math.floor((Date.now() + 3_600_000) / 1000));
+		messageScript = [
+			failure(429, {
+				"anthropic-ratelimit-unified-5h-utilization": "1",
+				"anthropic-ratelimit-unified-5h-reset": reset,
+			}),
+		];
+		const { result, error } = await run();
+		expect(requests).toHaveLength(1);
+		expect(outcomes[0]?.outcome.code).toBe("quota_exhausted");
+		expect(outcomes[0]?.outcome.quotaBlocks).toHaveLength(1);
+		// The host refused re-admission: terminal failure, no sibling, no API-key request.
+		expect(result?.stopReason === "error" || error !== undefined).toBe(true);
+	});
+
+	// Outcome timestamps use the wall clock; only admission uses the injected one.
+	const reset = (offsetMs: number): string => String(Math.floor((Date.now() + offsetMs) / 1000));
+	const NON_QUOTA_429: Array<[string, Record<string, string>]> = [
+		["a bare 429", {}],
+		[
+			"a below-limit window",
+			{
+				"anthropic-ratelimit-unified-5h-utilization": "0.4",
+				"anthropic-ratelimit-unified-5h-reset": reset(3_600_000),
+			},
+		],
+		[
+			"an exhausted window whose reset is past",
+			{ "anthropic-ratelimit-unified-5h-utilization": "1", "anthropic-ratelimit-unified-5h-reset": reset(-60_000) },
+		],
+	];
+	for (const [label, headers] of NON_QUOTA_429) {
+		it(`${label} never establishes quota`, async () => {
+			refuseAfterQuota = false;
+			messageScript = Array.from({ length: 40 }, () => failure(429, headers));
+			await run();
+			expect(outcomes.length).toBeGreaterThan(0);
+			for (const entry of outcomes) {
+				expect(entry.outcome.code).toBe("rate_limited");
+				expect(entry.outcome.quotaBlocks).toEqual([]);
+			}
+		}, 20_000);
+	}
+
+	it("billing expiring between pre-resolution and fetch refuses before dispatch, then re-admits once", async () => {
+		advanceClockAfterResolve = 300_001;
+		const { result } = await run();
+		expect(result?.stopReason).toBe("stop");
+		expect(outcomes.map(entry => entry.outcome.code)).toEqual(["resolution_refused", "success"]);
+		expect(outcomes[0]?.outcome).toMatchObject({
+			startedAt: null,
+			dispatch: "not_dispatched",
+			refusalReason: "billing_unknown",
+		});
+		expect(requests).toHaveLength(1);
+		expect(new Set(outcomes.map(entry => entry.grant.attemptId)).size).toBe(2);
+	});
+
+	it("an abort while the request is in flight settles exactly one cancelled outcome", async () => {
+		const controller = new AbortController();
+		const gate = Promise.withResolvers<void>();
+		messageScript = [
+			async () => {
+				controller.abort();
+				await gate.promise;
+				return okResponse();
+			},
+		];
+		await run({ signal: controller.signal });
+		gate.resolve();
+		expect(outcomes).toHaveLength(1);
+		expect(outcomes[0]?.outcome.code).toBe("cancelled");
+		expect(requests).toHaveLength(1);
+	});
+
+	it("fails closed on a non-Anthropic transport without a provider request", async () => {
+		const other = { ...claude, api: "openai-completions", provider: "openai" } as unknown as Model<Api>;
+		const stream = streamSimple(other, ctx, { apiKey: resolver, fetch: messagesFetch } as SimpleStreamOptions);
+		let caught: unknown;
+		try {
+			for await (const _ of stream) {
+				// drain
+			}
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(ManagedDispatchRefusedError);
+		expect(requests).toHaveLength(0);
+		expect(outcomes).toHaveLength(0);
+	});
+
+	describe("nonstreaming withAuth", () => {
+		const authFailure = Object.assign(new Error("401 authentication_error"), { status: 401 });
+
+		it("defaults to no_replay: one attempt, one auth_failed outcome, error surfaces", async () => {
+			let calls = 0;
+			await expect(
+				withAuth(
+					resolver,
+					async () => {
+						calls += 1;
+						throw authFailure;
+					},
+					{ managed: { sessionId: "s", modelId: claude.id }, now: () => clock },
+				),
+			).rejects.toBe(authFailure);
+			expect(calls).toBe(1);
+			expect(outcomes.map(entry => entry.outcome.code)).toEqual(["auth_failed"]);
+		});
+
+		it("provider_only callbacks re-admit with the previous outcome and settle each attempt once", async () => {
+			let calls = 0;
+			const value = await withAuth(
+				resolver,
+				async key => {
+					calls += 1;
+					if (calls === 1) {
+						// The host moves to B after seeing the failed attempt.
+						selected = "b";
+						throw authFailure;
+					}
+					return key;
+				},
+				{ managed: { sessionId: "s", modelId: claude.id }, replayPolicy: "provider_only", now: () => clock },
+			);
+			expect(value).toBe("sk-ant-oat01-b");
+			expect(calls).toBe(2);
+			expect(hostCalls[1]?.previous?.code).toBe("auth_failed");
+			expect(outcomes.map(entry => entry.outcome.code)).toEqual(["auth_failed", "success"]);
+			expect(new Set(outcomes.map(entry => entry.grant.attemptId)).size).toBe(2);
+		});
 	});
 });

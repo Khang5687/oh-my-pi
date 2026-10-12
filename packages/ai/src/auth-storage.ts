@@ -12,6 +12,7 @@
  * - `limits` — usage-limit marking and credential rotation
  * - `resets` — saved rate-limit resets
  * - `blocks` — persisted rate-limit blocks (auth-broker server seam)
+ * - `routing` — strict exact-row resolution for host-managed Claude routing
  *
  * @example
  * const auth = await AuthStorage.create(getAgentDbPath());
@@ -28,6 +29,7 @@ import { AccountPolicies } from "./auth/policy";
 import { CredentialPool } from "./auth/pool";
 import { OAuthRefresher } from "./auth/refresh";
 import { ResetCredits } from "./auth/resets";
+import { type RoutingApi, RoutingResolver } from "./auth/routing";
 import { RateLimits } from "./auth/rotation";
 import { CredentialSelector } from "./auth/select";
 import { SqliteAuthCredentialStore } from "./auth/sqlite-credential-store";
@@ -60,6 +62,7 @@ export {
 	resolveCredentialIdentityKey,
 	SqliteAuthCredentialStore,
 } from "./auth/sqlite-credential-store";
+export * from "./auth/routing";
 export * from "./auth/store";
 export * from "./auth/types";
 
@@ -74,6 +77,7 @@ interface AuthStorageModules {
 	limits: RateLimits;
 	resets: ResetCredits;
 	blocks: CredentialBlocks;
+	routing: RoutingResolver;
 }
 
 /**
@@ -134,6 +138,10 @@ export class AuthStorage {
 	/** Persisted rate-limit blocks (auth-broker server seam). */
 	get blocks(): BlocksApi {
 		return this.#modules.blocks;
+	}
+	/** Strict exact-row resolution for host-managed routing; never ranks, rotates or falls back. */
+	get routing(): RoutingApi {
+		return this.#modules.routing;
 	}
 
 	/**
@@ -261,6 +269,7 @@ export class AuthStorage {
 			limits,
 			resets: new ResetCredits({ store, pool, oauth, usage, usageCache, blocks }),
 			blocks,
+			routing: new RoutingResolver({ pool, overrides, oauth, usage, now: options.routingClock ?? Date.now }),
 		};
 	}
 

@@ -8428,3 +8428,118 @@ describe("speculative tool execution", () => {
 		await closing;
 	});
 });
+
+describe("agentLoop managed account routing", () => {
+	const grantFor = (call: { operationId: string; requestGeneration: number }, attemptId: string) => ({
+		hostEpoch: "epoch",
+		runtimeInstanceId: "rt",
+		admissionId: `adm-${attemptId}`,
+		selectionGeneration: 1,
+		policyRevision: 1,
+		accountRef: { storeNamespace: "7c9e6679-7425-40de-944b-e07fc1f90ae7", nativeRowId: 1 },
+		operationId: call.operationId,
+		attemptId,
+		requestGeneration: call.requestGeneration,
+		sessionId: "sess",
+		modelId: "mock",
+		purpose: "agent_turn",
+	});
+
+	it("begins one call before pre-resolution and seeds the stream with that same admission", async () => {
+		const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [] };
+		const mock = createMockModel({ responses: [{ content: ["hi"] }, { content: ["again"] }] });
+		const begun: Array<{ operationId: string; requestGeneration: number }> = [];
+		const acquired: string[] = [];
+		const driver = {
+			beginCall: (input: { sessionId: string; modelId: string; purpose: string; replayPolicy: "no_replay" }) => {
+				const call = { operationId: `op-${begun.length + 1}`, requestGeneration: begun.length + 1, ...input };
+				begun.push(call);
+				return call;
+			},
+			acquire: async () => {
+				throw new Error("acquire is the resolver's job in this test");
+			},
+			isConfigured: () => true,
+		};
+		const outcomes: string[] = [];
+		const resolver = Object.assign(
+			async (ctx: {
+				managedCall?: { operationId: string; requestGeneration: number };
+				previousOutcome?: unknown;
+			}) => {
+				const call = ctx.managedCall;
+				if (!call) throw new Error("managed resolver needs a call");
+				const attemptId = `att-${acquired.length + 1}`;
+				acquired.push(`${call.operationId}:${attemptId}:${ctx.previousOutcome === undefined ? "fresh" : "retry"}`);
+				return {
+					apiKey: `sk-ant-oat01-${attemptId}`,
+					managedAdmission: {
+						grant: grantFor(call, attemptId),
+						call: call as never,
+						beforeDispatch: async () => {},
+						started: () => {},
+						outcome: (outcome: { code: string }) => outcomes.push(outcome.code),
+					},
+				};
+			},
+			{ managedRouting: driver as never },
+		);
+		const seen: unknown[] = [];
+		const streamFn: typeof mock.stream = (model, callContext, options) => {
+			seen.push(options?.apiKey);
+			return mock.stream(model, callContext, options);
+		};
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			sessionId: "sess",
+			apiKey: resolver as never,
+		};
+
+		await agentLoop([createUserMessage("one")], context, config, undefined, streamFn).result();
+
+		// One logical call, one host acquisition for the turn: the seed answers the stream's first resolve.
+		expect(begun).toHaveLength(1);
+		expect(begun[0]).toMatchObject({
+			modelId: mock.model.id,
+			purpose: "agent_turn",
+			replayPolicy: "no_replay",
+			sessionId: "sess",
+		});
+		expect(acquired).toEqual(["op-1:att-1:fresh"]);
+		const seeded = seen[0] as ((ctx: Record<string, unknown>) => Promise<{ apiKey: string }>) & {
+			managedRouting?: unknown;
+			seededManagedCall?: { operationId: string };
+		};
+		expect(seeded.managedRouting).toBe(driver);
+		expect(seeded.seededManagedCall?.operationId).toBe("op-1");
+		expect((await seeded({ lastChance: false, error: undefined })).apiKey).toBe("sk-ant-oat01-att-1");
+		expect(acquired).toHaveLength(1);
+		// A later attempt (previous outcome known) goes back to the host for a fresh grant.
+		const next = await seeded({
+			lastChance: false,
+			error: undefined,
+			managedCall: begun[0],
+			previousOutcome: { code: "provider_failed" },
+		});
+		expect(next.apiKey).toBe("sk-ant-oat01-att-2");
+		expect(acquired).toEqual(["op-1:att-1:fresh", "op-1:att-2:retry"]);
+	});
+
+	it("does not begin a managed call for an ordinary resolver or a static key", async () => {
+		const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [] };
+		const mock = createMockModel({ responses: [{ content: ["hi"] }] });
+		let calls = 0;
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			apiKey: async ctx => {
+				calls += 1;
+				expect((ctx as { managedCall?: unknown }).managedCall).toBeUndefined();
+				return "static-ish";
+			},
+		};
+		await agentLoop([createUserMessage("one")], context, config, undefined, mock.stream).result();
+		expect(calls).toBe(1);
+	});
+});

@@ -10,6 +10,7 @@ import {
 	type ComputerSafetyCheck,
 	type Context,
 	EventStream,
+	beginManagedCall,
 	isApiKeyResolver,
 	type Model,
 	resolveApiKeyOnce,
@@ -2022,9 +2023,21 @@ async function streamAssistantResponse(
 				: AbortSignal.any(providerAbortSignals);
 	const requestApiKey = (config.getApiKey ? await config.getApiKey(model) : undefined) ?? config.apiKey;
 	let resolvedCredential: ApiKeyResolution;
-	const resolvedApiKey = await resolveApiKeyOnce(requestApiKey, finalRequestSignal, resolved => {
-		resolvedCredential = resolved;
+	// One managed call per logical model invocation; the seeded admission carries it into the stream.
+	const managedCall = beginManagedCall(requestApiKey, {
+		sessionId: config.sessionId,
+		modelId: model.id,
+		purpose: "agent_turn",
+		signal: finalRequestSignal,
 	});
+	const resolvedApiKey = await resolveApiKeyOnce(
+		requestApiKey,
+		finalRequestSignal,
+		resolved => {
+			resolvedCredential = resolved;
+		},
+		managedCall,
+	);
 	const apiKey = isApiKeyResolver(requestApiKey)
 		? seedApiKeyResolver(resolvedCredential ?? resolvedApiKey, requestApiKey)
 		: requestApiKey;

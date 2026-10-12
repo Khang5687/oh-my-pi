@@ -2336,7 +2336,10 @@ const streamAnthropicOnce = (
 			// Built inside the try so a copilot credential/header failure surfaces as
 			// an error event instead of an unhandled rejection that leaves the stream
 			// (and any consumer awaiting `result()`) hanging forever.
-			const apiKey = options?.apiKey ?? getEnvApiKey(model.provider) ?? "";
+			// Managed routing re-admits per HTTP attempt and may swap the bearer, so the key is mutable.
+			const managed = options?.managedAttempts;
+			let apiKey = options?.apiKey ?? getEnvApiKey(model.provider) ?? "";
+			let servingIdentity = options?.oauthIdentity;
 			const copilotApiKey = model.provider === "github-copilot" ? parseGitHubCopilotApiKey(apiKey) : undefined;
 			const copilotBaseUrl =
 				model.provider === "github-copilot"
@@ -2630,21 +2633,27 @@ const streamAnthropicOnce = (
 			let { client, isOAuthToken } = resolveClient();
 			const preparedContext = await prepareAnthropicImageContext(context, model);
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
-				const built = buildParams(model, preparedContext, isOAuthToken, options, {
-					compactionSupported,
-					disableStrictTools,
-					useUmansGatewayWebSearch: umansGatewayWebSearchHeader !== undefined,
-					forceDemoteUnsignedThinking,
-					supportsEagerToolInputStreaming,
-					prefixMismatchBehavior,
-					dropAllThinking,
-					dropCacheControl,
-					dropCacheControlOptions,
-					droppedThinkingBlocks: providerSessionState?.prefixDroppedThinkingBlocks,
-					controlRecords: getControlRecords(),
-					fallbacks,
-					effectiveBaseUrl: baseUrl,
-				});
+				const built = buildParams(
+					model,
+					preparedContext,
+					isOAuthToken,
+					servingIdentity ? { ...options, oauthIdentity: servingIdentity } : options,
+					{
+						compactionSupported,
+						disableStrictTools,
+						useUmansGatewayWebSearch: umansGatewayWebSearchHeader !== undefined,
+						forceDemoteUnsignedThinking,
+						supportsEagerToolInputStreaming,
+						prefixMismatchBehavior,
+						dropAllThinking,
+						dropCacheControl,
+						dropCacheControlOptions,
+						droppedThinkingBlocks: providerSessionState?.prefixDroppedThinkingBlocks,
+						controlRecords: getControlRecords(),
+						fallbacks,
+						effectiveBaseUrl: baseUrl,
+					},
+				);
 				let nextParams = built.params;
 				// The last build wins: a retry may rebuild with different controls.
 				if (built.requestControls) output.requestControls = built.requestControls;
@@ -2867,6 +2876,19 @@ const streamAnthropicOnce = (
 			while (true) {
 				activeAbortTracker = createAbortSourceTracker(options?.signal);
 				const { requestSignal } = activeAbortTracker;
+				if (managed) {
+					// Every actual HTTP attempt (first, provider retry, body repair) is admitted and
+					// re-guarded by the host before anything is built for the wire.
+					const admitted = await managed.admit(options?.signal);
+					const accountChanged = admitted.oauthIdentity?.accountId !== servingIdentity?.accountId;
+					servingIdentity = admitted.oauthIdentity;
+					if (admitted.apiKey !== apiKey) {
+						apiKey = admitted.apiKey;
+						({ client, isOAuthToken } = resolveClient());
+					}
+					// metadata.user_id carries the serving account, so a different account needs a fresh body.
+					if (accountChanged) params = await prepareParams();
+				}
 				// The provider loop owns retries: pin the client's internal retry loop
 				// to zero even when no watchdog timeout is configured (the helper only
 				// pins it alongside a timeout; a client retry budget of 5 would otherwise
@@ -2977,6 +2999,7 @@ const streamAnthropicOnce = (
 						? client.beta.messages.create({ ...params, stream: true }, requestOptions)
 						: client.messages.create({ ...params, stream: true }, requestOptions);
 				let streamedReplayUnsafeContent = false;
+				managed?.started();
 
 				try {
 					let requestTimeout: NodeJS.Timeout | undefined;
@@ -3546,9 +3569,14 @@ const streamAnthropicOnce = (
 							kind: "output",
 						});
 					}
+					managed?.succeed(response.headers);
 					break;
 				} catch (streamError) {
 					const streamFailure = activeAbortTracker.getLocalAbortReason() ?? streamError;
+					managed?.fail(streamFailure, {
+						replayUnsafe: streamedReplayUnsafeContent,
+						aborted: activeAbortTracker.wasCallerAbort(),
+					});
 					if (
 						!disableStrictTools &&
 						firstTokenTime === undefined &&
@@ -3975,6 +4003,10 @@ const streamAnthropicOnce = (
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			options?.managedAttempts?.settleOpen(error, {
+				replayUnsafe: false,
+				aborted: activeAbortTracker.wasCallerAbort(),
+			});
 			for (const block of output.content) {
 				if (block.type === "toolCall") clearStreamingPartialJson(block);
 			}
@@ -5280,7 +5312,8 @@ function buildParams(
 	}
 
 	// Pre-compute metadata.
-	const metadataAccountId = readAnthropicMetadataAccountId(options?.metadata);
+	// The serving row's account wins over the session-affinity metadata so routing never mislabels a request.
+	const metadataAccountId = options?.oauthIdentity?.accountId ?? readAnthropicMetadataAccountId(options?.metadata);
 	const metadataUserId = resolveAnthropicMetadataUserId(
 		readAnthropicMetadataString(options?.metadata, "user_id") ??
 			// Deliberately share the normalized affinity identity across Kimi's two transports.
