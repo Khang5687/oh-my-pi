@@ -1,3 +1,4 @@
+import { isModelAuthAvailable } from "../config/model-registry";
 import { instrumentedCompleteSimple, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { type Api, type AssistantMessage, completeSimple, type Model, type Usage } from "@oh-my-pi/pi-ai";
@@ -103,8 +104,7 @@ export async function askImageQuestion(
 	}
 
 	const { model, selectedPattern } = resolved;
-	const apiKey = await modelRegistry.getApiKey(model);
-	if (!apiKey) {
+	if (!(await isModelAuthAvailable(modelRegistry, model, session.getSessionId?.() ?? undefined))) {
 		throw new ToolError(
 			`No API key available for ${model.provider}/${model.id}. Configure credentials for this provider or choose another vision-capable model.`,
 		);
@@ -152,7 +152,7 @@ export async function askImageQuestion(
 				],
 			},
 			{
-				apiKey: modelRegistry.resolver(model, session.getSessionId?.() ?? undefined),
+				apiKey: modelRegistry.resolver(model, session.getSessionId?.() ?? undefined, "vision"),
 				signal: effectiveSignal,
 				reasoning,
 			},

@@ -16,6 +16,7 @@
 import { completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { diffLineRuns, editDiffString, summarizeCode } from "@oh-my-pi/pi-natives";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
+import { isModelAuthAvailable } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { WritethroughCallback } from "../lsp";
 import type { ToolSession } from "../tools";
@@ -349,10 +350,9 @@ export async function attemptEditAutoRepair(options: {
 	const model = resolveRoleSelection(["smol"], session.settings, registry.getAvailable())?.model;
 	if (!model) return undefined;
 	const sessionId = session.getSessionId?.() ?? undefined;
-	// Resolve the key eagerly so the session-sticky credential is recorded and
+	// Check auth eagerly so the session-sticky credential is recorded and
 	// an unauthenticated smol role bails before any region work.
-	const apiKey = await registry.getApiKey(model, sessionId);
-	if (!apiKey) return undefined;
+	if (!(await isModelAuthAvailable(registry, model, sessionId))) return undefined;
 
 	// Repair against the bytes on disk, not the snapshot: a later operation in
 	// the same call or a format-on-write pass may have moved the file since the
@@ -378,7 +378,7 @@ export async function attemptEditAutoRepair(options: {
 					model,
 					{ messages: [{ role: "user", content: builtPrompt, timestamp: Date.now() }] },
 					{
-						apiKey: registry.resolver(model, sessionId),
+						apiKey: registry.resolver(model, sessionId, "repair"),
 						sessionId,
 						maxTokens: COMPLETION_MAX_TOKENS,
 						disableReasoning: true,

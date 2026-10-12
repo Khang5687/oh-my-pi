@@ -22,7 +22,7 @@ import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import type { Api, completeSimple, ImageContent, Model, TextContent } from "@oh-my-pi/pi-ai";
 import { logger, prompt, toError } from "@oh-my-pi/pi-utils";
 import { extractTextContent } from "../commit/utils";
-import type { ModelRegistry } from "../config/model-registry";
+import { isModelAuthAvailable, type ModelRegistry } from "../config/model-registry";
 import { expandRoleAlias, getModelMatchPreferences, resolveModelFromString } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { type LocalProtocolOptions, resolveLocalRoot } from "../internal-urls";
@@ -42,7 +42,8 @@ const DESCRIPTION_UNAVAILABLE_NOTE =
 	"[Image description unavailable: the vision model returned no usable text. The image was saved for further analysis.]";
 
 /** Registry surface needed to resolve a vision model and authorize requests. */
-export type VisionFallbackRegistry = Pick<ModelRegistry, "getAvailable" | "getApiKey" | "resolver">;
+export type VisionFallbackRegistry = Pick<ModelRegistry, "getAvailable" | "getApiKey" | "resolver"> &
+	Partial<Pick<ModelRegistry, "isManagedClaude" | "isAuthAvailable">>;
 
 /** Whether user images sent to `model` should be replaced by a vision-model description. */
 export function shouldDescribeImagesForTextModel(
@@ -158,7 +159,7 @@ async function describeImage(
 					},
 				],
 			},
-			{ apiKey: deps.modelRegistry.resolver(visionModel, deps.sessionId), signal },
+			{ apiKey: deps.modelRegistry.resolver(visionModel, deps.sessionId, "vision"), signal },
 			{ telemetry, oneshotKind: ONESHOT_KIND, completeImpl: deps.completeImpl },
 		);
 		if (response.stopReason === "error" || response.stopReason === "aborted") {
@@ -192,8 +193,9 @@ export async function describeAttachedImagesForTextModel(
 ): Promise<TextContent[]> {
 	const localRoot = resolveLocalRoot(deps.localProtocolOptions);
 	const visionModel = resolveVisionModel(deps);
-	const apiKey = visionModel ? await deps.modelRegistry.getApiKey(visionModel, deps.sessionId) : undefined;
-	const canDescribe = Boolean(visionModel && apiKey);
+	const canDescribe = Boolean(
+		visionModel && (await isModelAuthAvailable(deps.modelRegistry, visionModel, deps.sessionId)),
+	);
 	const telemetry = resolveTelemetry(deps.telemetryConfig, deps.sessionId);
 
 	return Promise.all(

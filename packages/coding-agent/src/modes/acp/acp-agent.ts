@@ -1,3 +1,4 @@
+import { isModelAuthAvailable } from "../../config/model-registry";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
@@ -2601,8 +2602,7 @@ export class AcpAgent implements Agent {
 				setActiveTools: toolNames => record.session.setActiveToolsByName(toolNames),
 				getCommands: () => getSessionSlashCommands(record.session),
 				setModel: async model => {
-					const apiKey = await record.session.modelRegistry.getApiKey(model);
-					if (!apiKey) {
+					if (!(await isModelAuthAvailable(record.session.modelRegistry, model))) {
 						return false;
 					}
 					await record.session.setModel(model);

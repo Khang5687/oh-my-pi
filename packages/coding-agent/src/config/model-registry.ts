@@ -3335,6 +3335,13 @@ export class ModelRegistry {
 
 	/** Resolve request authentication through the historical Pi extension facade. */
 	async getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth> {
+		// An extension would send this bearer itself, outside host admission: refuse by name.
+		if (this.isManagedClaude(model.provider)) {
+			return {
+				ok: false,
+				error: `"${model.provider}" is served by host-managed account routing; it releases no raw credential`,
+			};
+		}
 		try {
 			const apiKey = await this.getApiKey(model);
 			if (apiKey === undefined) {
@@ -3404,12 +3411,20 @@ export class ModelRegistry {
 	 * policy. Accepts a provider id with options, or a model with an optional
 	 * session id (`resolver(model, sessionId)`) which derives `baseUrl`/`modelId`
 	 * from the model. Callers that need the initial key for a guard can call
-	 * `resolveApiKeyOnce(resolver)`.
+	 * `resolveApiKeyOnce(resolver)`. `purpose` labels the call for host-managed
+	 * Claude routing (`title`, `memory`, `vision`, ...); other providers ignore it.
 	 */
 	resolver(provider: string, options?: ApiKeyResolverOptions): ApiKeyResolver;
-	resolver(model: ApiKeyResolverModel, sessionId?: string): ApiKeyResolver;
-	resolver(target: string | ApiKeyResolverModel, optionsOrSessionId?: ApiKeyResolverOptions | string): ApiKeyResolver {
-		const options = typeof optionsOrSessionId === "string" ? { sessionId: optionsOrSessionId } : optionsOrSessionId;
+	resolver(model: ApiKeyResolverModel, sessionId?: string, purpose?: string): ApiKeyResolver;
+	resolver(
+		target: string | ApiKeyResolverModel,
+		optionsOrSessionId?: ApiKeyResolverOptions | string,
+		purpose?: string,
+	): ApiKeyResolver {
+		const options =
+			typeof optionsOrSessionId === "string" || purpose !== undefined
+				? { sessionId: typeof optionsOrSessionId === "string" ? optionsOrSessionId : undefined, purpose }
+				: optionsOrSessionId;
 		const provider = typeof target === "string" ? target : target.provider;
 		const resolved: ApiKeyResolverOptions =
 			typeof target === "string" ? (options ?? {}) : { ...options, baseUrl: target.baseUrl, modelId: target.id };

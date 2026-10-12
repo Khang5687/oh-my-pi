@@ -4287,8 +4287,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			wrapStreamFnWithProviderConcurrency(
 				settings,
 				createSettingsAwareStreamFn(settings, undefined, {
+					// Host-owned routing picks the account per request: the sibling-health probe would be a
+					// native account-wide usage fetch, and the low-priority lane is not the host's choice.
 					canAutoAccept: streamModel =>
-						anthropicSlowModeHasNoSiblingHeadroom(modelRegistry.authStorage, streamModel, session?.sessionId),
+						modelRegistry.isManagedClaude(streamModel.provider)
+							? false
+							: anthropicSlowModeHasNoSiblingHeadroom(
+									modelRegistry.authStorage,
+									streamModel,
+									session?.sessionId,
+								),
 					notify: (level, message) => session?.emitNotice(level, message, "anthropic-slow-mode"),
 					onLane: lane => session?.noteAnthropicSlowModeLane(lane),
 				}),

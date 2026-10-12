@@ -12,7 +12,7 @@ import {
 	postmortem,
 	prompt,
 } from "@oh-my-pi/pi-utils";
-import type { ModelRegistry } from "../config/model-registry";
+import { isModelAuthAvailable, type ModelRegistry } from "../config/model-registry";
 import { getModelMatchPreferences, parseModelPattern, resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
@@ -55,15 +55,15 @@ export function createSkillDescriptionCompressor(
 			resolveRoleSelection(["tiny"], settings, available);
 		if (!selected) throw new Error("No smol or tiny model available");
 		const { model } = selected;
-		const apiKey = await registry.getApiKey(model, sessionId);
-		if (!apiKey) throw new Error(`No credential for ${model.provider}/${model.id}`);
+		if (!(await isModelAuthAvailable(registry, model, sessionId)))
+			throw new Error(`No credential for ${model.provider}/${model.id}`);
 		const response = await instrumentedCompleteSimple(
 			model,
 			{
 				messages: [{ role: "user", content: request, timestamp: Date.now() }],
 			},
 			{
-				apiKey: registry.resolver(model, sessionId),
+				apiKey: registry.resolver(model, sessionId, "other_auxiliary"),
 				sessionId,
 				maxTokens: 1024,
 				disableReasoning: true,

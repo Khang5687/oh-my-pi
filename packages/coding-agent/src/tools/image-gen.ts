@@ -264,6 +264,10 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					continue;
 				}
 
+				if (ctx.modelRegistry.isManagedClaude(model.provider)) {
+					skipped.push(`${model.provider}/${model.id} (unsupported under host-managed account routing)`);
+					continue;
+				}
 				const initialKey = await ctx.modelRegistry.getApiKey(model, sessionId, { signal: requestSignal });
 				if (!isAuthenticated(initialKey)) {
 					skipped.push(`${model.provider}/${model.id} (credentials unavailable)`);
@@ -280,6 +284,12 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					carrier = model.hostedImage ? model : resolveHostedImageCarrier(ctx.modelRegistry, model, ctx.model);
 					if (!carrier) {
 						skipped.push(`${model.provider}/${model.id} (hosted chat carrier unavailable)`);
+						continue;
+					}
+					if (ctx.modelRegistry.isManagedClaude(carrier.provider)) {
+						skipped.push(
+							`${model.provider}/${model.id} (carrier unsupported under host-managed account routing)`,
+						);
 						continue;
 					}
 					const carrierKey = await ctx.modelRegistry.getApiKey(carrier, sessionId, { signal: requestSignal });
