@@ -9,6 +9,8 @@
  * regression that motivated the split.
  */
 import type { CommandEntry } from "@oh-my-pi/pi-utils/cli";
+import { VERSION } from "@oh-my-pi/pi-utils/dirs";
+import { runAccountRoutingCapabilities } from "./cli/account-routing-capabilities-cli";
 import * as commandHelp from "./cli/command-help";
 import {
 	EXTENSION_SHADOWABLE_STRING_FLAGS,
@@ -31,6 +33,25 @@ export const commands: CommandEntry[] = [
 		get help() {
 			return loadLaunchHelp();
 		},
+	},
+	{
+		name: "account-routing-capabilities",
+		// `runCli` answers this command before network bootstrap; this class serves help and `run` fallbacks.
+		load: async () => {
+			const { Command, Flags } = await import("@oh-my-pi/pi-utils/cli");
+			return class AccountRoutingCapabilities extends Command {
+				static description = commandHelp.accountRoutingCapabilitiesHelp.description;
+				static flags = { mode: Flags.string({ description: "Probe mode: model (default) or metadata" }) };
+				async run(): Promise<void> {
+					const code = runAccountRoutingCapabilities(this.argv, VERSION || null, {
+						stdout: text => void process.stdout.write(text),
+						stderr: text => void process.stderr.write(text),
+					});
+					if (code !== 0) process.exitCode = code;
+				}
+			};
+		},
+		help: commandHelp.accountRoutingCapabilitiesHelp,
 	},
 	{
 		name: "acp",
