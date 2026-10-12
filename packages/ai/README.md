@@ -1210,6 +1210,25 @@ returns the already-cached report for one native row, bound to the store namespa
 never fetches or refreshes. `UsageService.refreshRoutingObservation` reads one exact row
 from a fresh full response for a native owner that already selected the credential.
 
+### Cache-only Claude capacity ranking
+
+`rankRoutingCandidates({ accounts, candidateRefs, modelId, nowMs })` (`auth/rank.ts`) ranks a
+host-chosen subset of one source's accounts from already-observed windows, billing and quota
+blocks. It is pure: no fetch, no refresh, injected clock. It is separate from the ordinary
+selector, which keeps its priority, reserve and fallback ordering.
+
+Only accounts with `disabled` billing inside its 300000ms span, no applicable confirmed block, a
+passing plan gate (`unknown` passes only when no gate applies) and fresh shared 5h and 7d windows
+plus every reported window for the model's family are ranked. Any missing, stale or malformed
+required window nulls all four metrics and `primaryHot` and marks coverage unknown; a passed reset
+time never zeroes them, and a block is retired only by a fresh post-reset observation. Order is cool
+before hot (`primaryUsed >= 0.85`), then `secondaryRequiredDrain` descending, `secondaryUsed`
+ascending, `primaryRequiredDrain` descending, `primaryUsed` ascending, then namespace and row.
+`bestCloseRefs` holds every eligible account whose four metrics are within the native epsilon of the
+single best anchor; there is no chaining between neighbours. Subscription tier (Pro versus Max) is
+not available from the usage payload, so plan eligibility is an input, and the result is a
+window-pressure heuristic, not token capacity.
+
 ### Provider Notes
 
 **OpenAI Codex**: Requires a ChatGPT Plus or Pro subscription. Provides access to GPT-5.x Codex models with extended context windows and reasoning capabilities. The library automatically handles session-based prompt caching when `sessionId` is provided in stream options.
