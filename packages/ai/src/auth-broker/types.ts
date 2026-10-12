@@ -11,9 +11,16 @@ import type {
 	AuthCredentialSnapshot,
 	AuthCredentialSnapshotEntry,
 	DisabledCredentialSummary,
+	RoutingExactUsageUnknownCode,
 	StoredCredentialBlock,
 } from "../auth-storage";
-import type { ClientUsageClientSummary, ClientUsageReport, UsageHistoryEntry, UsageReport } from "../usage";
+import type {
+	ClientUsageClientSummary,
+	ClientUsageReport,
+	RoutingObservation,
+	UsageHistoryEntry,
+	UsageReport,
+} from "../usage";
 
 /** GET /v1/healthz response body. */
 export interface HealthzResponse {
@@ -59,6 +66,25 @@ export interface UsageHistoryResponse {
 	generatedAt: number;
 	entries: UsageHistoryEntry[];
 }
+
+/**
+ * POST /v1/usage/exact request body. Metadata identity of one native row only; no credential,
+ * auth-store path or sibling list. Requires the `exact-usage-v1` and `source-identity-v1` capabilities.
+ */
+export interface ExactUsageRequest {
+	provider: "anthropic";
+	storeNamespace: string;
+	nativeRowId: number;
+	modelId: string | null;
+	baseUrl: string;
+}
+
+/** POST /v1/usage/exact response body. Echoes the request identity so the client can bind it. */
+export type ExactUsageResponse = ExactUsageRequest &
+	(
+		| { status: "observed"; observation: RoutingObservation }
+		| { status: "unknown"; code: RoutingExactUsageUnknownCode }
+	);
 
 /** POST /v1/usage/observed request body — one client's batched observed usage. */
 export type ClientUsageReportRequest = ClientUsageReport;
@@ -181,10 +207,14 @@ export const AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES = "codex-meter-bloc
 /** Client understands the optional `storeNamespace` on snapshots and stream deltas. */
 export const AUTH_BROKER_CAPABILITY_SOURCE_IDENTITY_V1 = "source-identity-v1";
 
+/** Client can send and validate `POST /v1/usage/exact` (selected-row billing refresh). */
+export const AUTH_BROKER_CAPABILITY_EXACT_USAGE_V1 = "exact-usage-v1";
+
 /** Value of {@link AUTH_BROKER_CAPABILITIES_HEADER} sent by current clients. */
 export const AUTH_BROKER_CLIENT_CAPABILITIES = [
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	AUTH_BROKER_CAPABILITY_SOURCE_IDENTITY_V1,
+	AUTH_BROKER_CAPABILITY_EXACT_USAGE_V1,
 ].join(",");
 
 /** Default port when none is configured. Loopback-only, no external exposure. */

@@ -1716,8 +1716,8 @@ describe("AuthStorage usage cache: routing billing observation", () => {
 		}) as unknown as typeof fetch);
 		const cacheBefore = store.cache.size;
 		try {
-			const usage = storage.usage as unknown as { refreshRoutingObservation: AuthStorageUsageRefresh };
-			const observation = await usage.refreshRoutingObservation({
+			const usage = storage.usage as unknown as { queryRoutingObservation: AuthStorageUsageRefresh };
+			const observation = await usage.queryRoutingObservation({
 				binding: { storeNamespace: NAMESPACE, nativeRowId: 1, accountId: "account-1", organizationId: null },
 				credential: { type: "oauth", accessToken: "oat-1", accountId: "account-1", email: "a@example.com" },
 				modelId: null,
@@ -1733,7 +1733,7 @@ describe("AuthStorage usage cache: routing billing observation", () => {
 			expect(urls.every(url => !url.includes("oat-2"))).toBe(true);
 			expect(store.cache.size).toBe(cacheBefore);
 
-			const foreign = await usage.refreshRoutingObservation({
+			const foreign = await usage.queryRoutingObservation({
 				binding: { storeNamespace: NAMESPACE, nativeRowId: 1, accountId: "another-account", organizationId: null },
 				credential: { type: "oauth", accessToken: "oat-1", accountId: "account-1", email: "a@example.com" },
 				modelId: null,
@@ -1744,6 +1744,224 @@ describe("AuthStorage usage cache: routing billing observation", () => {
 		} finally {
 			storage.close();
 		}
+	});
+
+	describe("exact selected-row refresh", () => {
+		const ref = (nativeRowId: number) => ({ storeNamespace: NAMESPACE, nativeRowId });
+		const exact = (overrides: Record<string, unknown> = {}) => ({
+			accountRef: ref(1),
+			provider: "anthropic" as const,
+			modelId: null,
+			baseUrl: BASE_URL,
+			nowMs: NOW,
+			...overrides,
+		});
+
+		function countingFetch(status = 200) {
+			const calls: Array<{ url: string; bearer: string }> = [];
+			const impl = (async (input: string | URL | Request, init?: RequestInit) => {
+				const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+				calls.push({ url, bearer: new Headers(init?.headers).get("authorization") ?? "" });
+				if (url !== CANONICAL) return new Response("{}", { status: 404 });
+				if (status !== 200) return new Response("{}", { status });
+				return new Response(JSON.stringify(fullPayload(false)), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}) as unknown as typeof fetch;
+			return { calls, impl, usage: () => calls.filter(call => call.url === CANONICAL) };
+		}
+
+		it("reads only the selected row, binds it, and leaves the usage cache untouched", async () => {
+			const store = makeSource([oauthRow(1, "a@example.com"), oauthRow(2, "b@example.com")]);
+			const fetcher = countingFetch();
+			const storage = await open(store, fetcher.impl);
+			const cacheBefore = store.cache.size;
+			try {
+				const result = await storage.usage.refreshRoutingObservation(exact());
+				expect(result).toMatchObject({
+					kind: "observed",
+					accountRef: ref(1),
+					observation: {
+						storeNamespace: NAMESPACE,
+						nativeRowId: 1,
+						billing: { state: "disabled", observedAt: NOW },
+					},
+				});
+				expect(fetcher.usage().map(call => call.bearer)).toEqual(["Bearer oat-1"]);
+				expect(store.cache.size).toBe(cacheBefore);
+			} finally {
+				storage.close();
+			}
+		});
+
+		it("serves the cached observation until exactly 300000ms, then reads the provider again", async () => {
+			const store = makeSource([oauthRow(1, "a@example.com")]);
+			const fetcher = countingFetch();
+			const storage = await open(store, fetcher.impl);
+			try {
+				await storage.usage.refreshRoutingObservation(exact());
+				const early = await storage.usage.refreshRoutingObservation(exact({ nowMs: NOW + 299_999 }));
+				expect(early).toMatchObject({ kind: "observed", observation: { billing: { state: "disabled" } } });
+				expect(fetcher.usage()).toHaveLength(1);
+
+				// At the boundary the cached evidence is unknown, so the read goes back to the provider.
+				const boundary = await storage.usage.refreshRoutingObservation(exact({ nowMs: NOW + 300_000 }));
+				expect(fetcher.usage()).toHaveLength(2);
+				expect(boundary).toMatchObject({
+					kind: "observed",
+					observation: { billing: { state: "disabled", observedAt: NOW + 300_000 } },
+				});
+			} finally {
+				storage.close();
+			}
+		});
+
+		it("returns unknown at exactly 300000ms when the provider cannot be re-read, ignoring header ingests", async () => {
+			const store = makeSource([oauthRow(1, "a@example.com")]);
+			let status = 200;
+			const base = countingFetch();
+			const storage = await open(store, (async (input: string | URL | Request, init?: RequestInit) =>
+				status === 200 ? base.impl(input, init) : new Response("{}", { status })) as unknown as typeof fetch);
+			try {
+				await storage.usage.refreshRoutingObservation(exact());
+				await storage.keys.get("anthropic", "exact-session");
+				expect(
+					storage.usage.ingestHeaders("anthropic", usageHeaders("0.05", "0.9"), { sessionId: "exact-session" }),
+				).toBe(true);
+				status = 500;
+				expect(await storage.usage.refreshRoutingObservation(exact({ nowMs: NOW + 299_999 }))).toMatchObject({
+					kind: "observed",
+					observation: { billing: { state: "disabled", observedAt: NOW } },
+				});
+				expect(await storage.usage.refreshRoutingObservation(exact({ nowMs: NOW + 300_000 }))).toEqual({
+					kind: "unknown",
+					accountRef: ref(1),
+					code: "unavailable",
+				});
+			} finally {
+				storage.close();
+			}
+		});
+
+		it("coalesces concurrent callers per key and fetches separately per model and base URL", async () => {
+			const store = makeSource([oauthRow(1, "a@example.com")]);
+			const gate = Promise.withResolvers<void>();
+			const base = countingFetch();
+			const storage = await open(store, (async (input: string | URL | Request, init?: RequestInit) => {
+				await gate.promise;
+				return base.impl(input, init);
+			}) as unknown as typeof fetch);
+			try {
+				const pending = [
+					storage.usage.refreshRoutingObservation(exact()),
+					storage.usage.refreshRoutingObservation(exact()),
+					storage.usage.refreshRoutingObservation(exact({ modelId: "claude-sonnet-5-5" })),
+				];
+				gate.resolve();
+				expect((await Promise.all(pending)).every(result => result.kind === "observed")).toBe(true);
+				expect(base.usage()).toHaveLength(2);
+			} finally {
+				storage.close();
+			}
+		});
+
+		it("cancels one caller without cancelling the other, and a pre-aborted caller makes no request", async () => {
+			const store = makeSource([oauthRow(1, "a@example.com")]);
+			const gate = Promise.withResolvers<void>();
+			const base = countingFetch();
+			const storage = await open(store, (async (input: string | URL | Request, init?: RequestInit) => {
+				await gate.promise;
+				return base.impl(input, init);
+			}) as unknown as typeof fetch);
+			try {
+				const early = new AbortController();
+				early.abort();
+				expect(await storage.usage.refreshRoutingObservation(exact({ signal: early.signal }))).toMatchObject({
+					code: "cancelled",
+				});
+				const abortA = new AbortController();
+				const a = storage.usage.refreshRoutingObservation(exact({ signal: abortA.signal }));
+				const b = storage.usage.refreshRoutingObservation(exact());
+				abortA.abort();
+				expect(await a).toMatchObject({ kind: "unknown", code: "cancelled" });
+				gate.resolve();
+				expect((await b).kind).toBe("observed");
+				expect(base.usage()).toHaveLength(1);
+			} finally {
+				storage.close();
+			}
+		});
+
+		it("refuses a missing namespace, foreign namespace, absent row, API-key row and untrusted base URL with no request", async () => {
+			const fetcher = countingFetch();
+			const noNamespace = await open(makeSource([oauthRow(1, "a@example.com")], null), fetcher.impl);
+			const storage = await open(
+				makeSource([
+					oauthRow(1, "a@example.com"),
+					{
+						id: 3,
+						provider: "anthropic",
+						credential: { type: "api_key", key: "sk-test" },
+						disabledCause: null,
+					},
+				]),
+				fetcher.impl,
+			);
+			try {
+				expect(await noNamespace.usage.refreshRoutingObservation(exact())).toMatchObject({
+					code: "source_changed",
+				});
+				const code = async (overrides: Record<string, unknown>) => {
+					const result = await storage.usage.refreshRoutingObservation(exact(overrides));
+					return result.kind === "unknown" ? result.code : "observed";
+				};
+				expect(await code({ accountRef: ref(9) })).toBe("row_unavailable");
+				expect(await code({ accountRef: ref(3) })).toBe("row_unavailable");
+				expect(
+					await code({ accountRef: { storeNamespace: "11111111-1111-4111-8111-111111111111", nativeRowId: 1 } }),
+				).toBe("source_changed");
+				expect(await code({ baseUrl: "https://proxy.example/v1" })).toBe("untrusted_endpoint");
+				expect(await code({ nowMs: Number.NaN })).toBe("invalid_request");
+				expect(fetcher.calls).toHaveLength(0);
+			} finally {
+				noNamespace.close();
+				storage.close();
+			}
+		});
+
+		it("never serves a broker-style store (aggregate hooks, no exact hook) from sentinel rows", async () => {
+			const store = makeSource([oauthRow(1, "a@example.com")]);
+			store.getUsageReport = async () => {
+				throw new Error("aggregate usage must not be called");
+			};
+			const fetcher = countingFetch();
+			const storage = await open(store, fetcher.impl);
+			try {
+				expect(await storage.usage.refreshRoutingObservation(exact())).toEqual({
+					kind: "unknown",
+					accountRef: ref(1),
+					code: "unsupported",
+				});
+				expect(fetcher.calls).toHaveLength(0);
+			} finally {
+				storage.close();
+			}
+		});
+
+		it("peekByCredentialId issues no fetch even for a cold cache", async () => {
+			const store = makeSource([oauthRow(1, "a@example.com")]);
+			const fetcher = countingFetch();
+			const storage = await open(store, fetcher.impl);
+			try {
+				expect(
+					storage.usage.peekByCredentialId({ provider: "anthropic", credentialId: 1, baseUrl: BASE_URL }),
+				).toBeNull();
+				expect(fetcher.calls).toHaveLength(0);
+			} finally {
+				storage.close();
+			}
+		});
 	});
 });
 

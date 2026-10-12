@@ -12,6 +12,7 @@ import type {
 	ClientUsageReport,
 	ClientUsageSummary,
 	CredentialRankingStrategy,
+	RoutingObservation,
 	UsageHistoryEntry,
 	UsageHistoryQuery,
 	UsageLogger,
@@ -1259,8 +1260,56 @@ export interface UsageCachePeekRequest {
 	baseUrl: string;
 }
 
+/** Exact-row billing refresh input for {@link UsageApi.refreshRoutingObservation}. */
+export interface RoutingExactUsageRequest {
+	accountRef: AccountRef;
+	provider: "anthropic";
+	modelId: string | null;
+	/** Must be the trusted first-party Anthropic API root (or its `/v1` or `/api/oauth` form). */
+	baseUrl: string;
+	signal?: AbortSignal;
+	/** Skip the exact-row cache; an in-flight read for the same key is still joined. */
+	forceRefresh?: boolean;
+	/** Injected clock. Observation time and the 300000ms billing expiry are measured against it. */
+	nowMs: number;
+}
+
+/** Why an exact refresh produced no observation. Never carries provider text. */
+export const ROUTING_EXACT_USAGE_UNKNOWN_CODES = [
+	"invalid_request",
+	"unsupported",
+	"source_changed",
+	"row_unavailable",
+	"untrusted_endpoint",
+	"identity_mismatch",
+	"unavailable",
+	"cancelled",
+] as const;
+export type RoutingExactUsageUnknownCode = (typeof ROUTING_EXACT_USAGE_UNKNOWN_CODES)[number];
+
+/**
+ * Metadata-only outcome of one exact-row refresh. `observation` is bound to `accountRef`
+ * with its billing already evaluated at the request's `nowMs`.
+ */
+export type RoutingExactUsageResult =
+	| {
+			kind: "observed";
+			accountRef: AccountRef;
+			modelId: string | null;
+			baseUrl: string;
+			observation: RoutingObservation;
+	  }
+	| { kind: "unknown"; accountRef: AccountRef; code: RoutingExactUsageUnknownCode };
+
 /** Usage reporting, observation, and provider configuration. */
 export interface UsageApi {
+	/**
+	 * Admission-only read of one exact native row's billing and window evidence from a trusted
+	 * full usage response. Local stores query the provider once per coalesced key; broker-backed
+	 * stores ask the broker owner. Never lists siblings, falls back to aggregate reports, or
+	 * renews billing from headers or overlays.
+	 */
+	refreshRoutingObservation(request: RoutingExactUsageRequest): Promise<RoutingExactUsageResult>;
 	/** Fetch aggregate usage reports for configured providers. */
 	reports(options?: {
 		baseUrlResolver?: (provider: Provider) => string | undefined;

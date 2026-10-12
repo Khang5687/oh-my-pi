@@ -5,6 +5,7 @@ import * as AIError from "../error";
 import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import {
+	currentIncludedBilling,
 	mergeHeaderRoutingObservation,
 	type RoutingBinding,
 	type RoutingObservation,
@@ -25,7 +26,7 @@ import type {
 	UsageProvider,
 	UsageReport,
 } from "../usage";
-import { claudeOAuthBaseUrl } from "../usage/claude-api";
+import { claudeOAuthBaseUrl, DEFAULT_CLAUDE_API_BASE_URL, normalizeClaudeApiBaseUrl } from "../usage/claude-api";
 import { DEFAULT_USAGE_PROVIDERS } from "../usage/registry";
 import { raceSignal } from "./abort";
 import type { SessionAffinity } from "./affinity";
@@ -47,7 +48,16 @@ import type { OAuthRefresher } from "./refresh";
 import { USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
 import type { AuthCredentialStore } from "./store";
 import { isStoreNamespace } from "./types";
-import type { AuthCredential, OAuthCredential, ObservedUsageInput, UsageApi, UsageCachePeekRequest } from "./types";
+import type {
+	AuthCredential,
+	OAuthCredential,
+	ObservedUsageInput,
+	RoutingExactUsageRequest,
+	RoutingExactUsageResult,
+	RoutingExactUsageUnknownCode,
+	UsageApi,
+	UsageCachePeekRequest,
+} from "./types";
 import {
 	dedupeUsageReports,
 	isUsageLimitExhausted,
@@ -55,6 +65,64 @@ import {
 	usageReportMetadataValue,
 	usageReportScopeAccountId,
 } from "./usage-report";
+
+const MAX_EXACT_MODEL_ID_LENGTH = 256;
+
+/** True only for the first-party Anthropic API root, optionally with its `/v1` or `/api/oauth` suffix. */
+export function isTrustedClaudeBaseUrl(baseUrl: string): boolean {
+	let url: URL;
+	try {
+		url = new URL(baseUrl);
+	} catch {
+		return false;
+	}
+	if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return false;
+	if (url.origin !== DEFAULT_CLAUDE_API_BASE_URL) return false;
+	return normalizeClaudeApiBaseUrl(baseUrl) === DEFAULT_CLAUDE_API_BASE_URL;
+}
+
+/** Validate an exact-refresh request's shape; returns the rejection code, or null when well-formed. */
+export function exactUsageRequestRejection(
+	request: Pick<RoutingExactUsageRequest, "accountRef" | "provider" | "modelId" | "baseUrl" | "nowMs">,
+): RoutingExactUsageUnknownCode | null {
+	const { accountRef, modelId } = request;
+	if (
+		request.provider !== "anthropic" ||
+		!isStoreNamespace(accountRef?.storeNamespace) ||
+		!Number.isSafeInteger(accountRef.nativeRowId) ||
+		accountRef.nativeRowId < 1 ||
+		!(
+			modelId === null ||
+			(typeof modelId === "string" && modelId.length > 0 && modelId.length <= MAX_EXACT_MODEL_ID_LENGTH)
+		) ||
+		typeof request.baseUrl !== "string" ||
+		!Number.isFinite(request.nowMs)
+	) {
+		return "invalid_request";
+	}
+	return isTrustedClaudeBaseUrl(request.baseUrl) ? null : "untrusted_endpoint";
+}
+
+/** Whether an observation belongs to exactly this row, endpoint and (when both sides know it) account/org. */
+function observationBelongsToRow(
+	observation: RoutingObservation,
+	ref: { storeNamespace: string; nativeRowId: number },
+	baseUrl: string,
+	credential: { accountId?: string; orgId?: string },
+): boolean {
+	if (observation.storeNamespace !== ref.storeNamespace || observation.nativeRowId !== ref.nativeRowId) return false;
+	if (observation.endpoint !== `${claudeOAuthBaseUrl(baseUrl)}/usage`) return false;
+	const { accountId, orgId } = credential;
+	if (observation.accountId !== null && accountId !== undefined && observation.accountId !== accountId) return false;
+	if (observation.organizationId !== null && orgId !== undefined && observation.organizationId !== orgId) return false;
+	return true;
+}
+
+interface ExactUsageFlight {
+	promise: Promise<RoutingObservation | RoutingExactUsageUnknownCode>;
+	controller: AbortController;
+	waiters: number;
+}
 
 /** Convert an OAuth usage credential into a refreshable stored shape; used by probes and health. */
 export function buildRefreshableOauthCredential(credential: UsageCredential): OAuthCredential | null {
@@ -128,6 +196,9 @@ export class UsageService implements UsageApi {
 	#usageRequestInFlight: Map<string, { refreshEpoch: number; promise: Promise<UsageReport | null> }> = new Map();
 	#usageHeaderIngestAt: Map<string, number> = new Map();
 	#usageReportsInFlight: Map<string, Promise<UsageReport[] | null>> = new Map();
+	/** Last explicit-billing observation per exact key. Only the exact refresh path writes it. */
+	#exactUsageCache: Map<string, RoutingObservation> = new Map();
+	#exactUsageInFlight: Map<string, ExactUsageFlight> = new Map();
 	readonly fetch: typeof fetch;
 	readonly logger: UsageLogger;
 	readonly requestTimeoutMs: number;
@@ -732,11 +803,135 @@ export class UsageService implements UsageApi {
 	}
 
 	/**
+	 * Admission-only exact-row refresh. Resolves the one durable row, then either queries the
+	 * provider locally or asks the broker owner; both coalesce per namespace+provider+row+model+base URL.
+	 * Every caller's cancellation is independent: the shared read aborts only when its last waiter leaves.
+	 */
+	async refreshRoutingObservation(request: RoutingExactUsageRequest): Promise<RoutingExactUsageResult> {
+		const { accountRef, nowMs } = request;
+		const unknown = (code: RoutingExactUsageUnknownCode): RoutingExactUsageResult => ({
+			kind: "unknown",
+			accountRef,
+			code,
+		});
+		const rejected = exactUsageRequestRejection(request);
+		if (rejected) return unknown(rejected);
+		if (request.signal?.aborted) return unknown("cancelled");
+
+		const source = this.#deps.pool.routingIdentities({ provider: "anthropic" }).source;
+		if (source.status !== "supported" || source.storeNamespace !== accountRef.storeNamespace) {
+			return unknown("source_changed");
+		}
+		const row = this.#deps.pool.entries("anthropic").find(candidate => candidate.id === accountRef.nativeRowId);
+		const stored = row?.credential;
+		if (stored?.type !== "oauth") return unknown("row_unavailable");
+
+		const key = [
+			accountRef.storeNamespace,
+			request.provider,
+			accountRef.nativeRowId,
+			request.modelId ?? "",
+			claudeOAuthBaseUrl(request.baseUrl),
+		].join("\0");
+		const done = (observation: RoutingObservation): RoutingExactUsageResult => ({
+			kind: "observed",
+			accountRef,
+			modelId: request.modelId,
+			baseUrl: request.baseUrl,
+			observation: { ...observation, billing: currentIncludedBilling(observation.billing, nowMs) },
+		});
+
+		const cached = this.#exactUsageCache.get(key);
+		if (cached) {
+			if (
+				!request.forceRefresh &&
+				currentIncludedBilling(cached.billing, nowMs).state !== "unknown" &&
+				observationBelongsToRow(cached, accountRef, request.baseUrl, stored)
+			) {
+				return done(cached);
+			}
+			this.#exactUsageCache.delete(key);
+		}
+
+		let flight = this.#exactUsageInFlight.get(key);
+		if (!flight) {
+			const controller = new AbortController();
+			const fresh: ExactUsageFlight = {
+				controller,
+				waiters: 0,
+				promise: this.#readExactObservation(request, stored, controller.signal).finally(() => {
+					if (this.#exactUsageInFlight.get(key) === fresh) this.#exactUsageInFlight.delete(key);
+				}),
+			};
+			this.#exactUsageInFlight.set(key, fresh);
+			flight = fresh;
+		}
+		const joined = flight;
+		joined.waiters += 1;
+		let outcome: RoutingObservation | RoutingExactUsageUnknownCode;
+		try {
+			outcome = await raceSignal(joined.promise, request.signal, "exact usage refresh aborted");
+		} catch (error) {
+			if (request.signal?.aborted) return unknown("cancelled");
+			this.logger?.debug("Exact routing refresh failed", { error: String(error) });
+			return unknown("unavailable");
+		} finally {
+			joined.waiters -= 1;
+			// Last waiter gone while the read is still pending: drop it first so a late caller starts a
+			// fresh read instead of joining an aborting one, then abort the shared request.
+			if (joined.waiters === 0 && this.#exactUsageInFlight.get(key) === joined) {
+				this.#exactUsageInFlight.delete(key);
+				joined.controller.abort();
+			}
+		}
+		if (typeof outcome === "string") return unknown(outcome);
+		if (!observationBelongsToRow(outcome, accountRef, request.baseUrl, stored)) return unknown("identity_mismatch");
+		// ponytail: failures are not negatively cached; the admission driver owns retry pacing.
+		if (outcome.billing.state !== "unknown") this.#exactUsageCache.set(key, outcome);
+		return done(outcome);
+	}
+
+	async #readExactObservation(
+		request: RoutingExactUsageRequest,
+		stored: OAuthCredential,
+		signal: AbortSignal,
+	): Promise<RoutingObservation | RoutingExactUsageUnknownCode> {
+		const { accountRef } = request;
+		const store = this.#deps.store;
+		if (store.refreshExactUsage) {
+			return store.refreshExactUsage({
+				accountRef,
+				provider: request.provider,
+				modelId: request.modelId,
+				baseUrl: request.baseUrl,
+				nowMs: request.nowMs,
+				signal,
+			});
+		}
+		// A store that owns credentials elsewhere but cannot answer exactly must not be served from sentinel rows.
+		if (store.getUsageReport || store.fetchUsageReports) return "unsupported";
+		const observation = await this.queryRoutingObservation({
+			binding: {
+				storeNamespace: accountRef.storeNamespace,
+				nativeRowId: accountRef.nativeRowId,
+				accountId: stored.accountId ?? null,
+				organizationId: stored.orgId ?? null,
+			},
+			credential: buildUsageCredential(stored),
+			modelId: request.modelId,
+			baseUrl: request.baseUrl,
+			signal,
+			nowMs: request.nowMs,
+		});
+		return observation ?? "unavailable";
+	}
+
+	/**
 	 * Read one exact row's billing and window evidence from a fresh full usage response.
 	 * Uses the single caller-selected credential: no sibling lookup, no cache write, no
 	 * token refresh. Only the provider parser sets the observation time (`nowMs`).
 	 */
-	async refreshRoutingObservation(args: {
+	async queryRoutingObservation(args: {
 		binding: RoutingBinding;
 		credential: UsageCredential;
 		modelId: string | null;

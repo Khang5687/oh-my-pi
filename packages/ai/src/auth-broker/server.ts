@@ -12,12 +12,19 @@
 
 import { type Type, type } from "@oh-my-pi/omptype";
 import { logger } from "@oh-my-pi/pi-utils";
-import type { AuthCredentialSnapshotEntry, AuthStorage, StoredCredentialBlock } from "../auth-storage";
+import type {
+	AuthCredentialSnapshotEntry,
+	AuthStorage,
+	RoutingExactUsageUnknownCode,
+	StoredCredentialBlock,
+} from "../auth-storage";
 import { parseBind } from "../utils/parse-bind";
 import { resolvePeer } from "../utils/resolve-peer";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
 import type {
 	ClientUsageReportRequest,
+	ExactUsageRequest,
+	ExactUsageResponse,
 	CredentialBlockResponse,
 	CredentialBlockSnapshot,
 	CredentialBlocksDeleteResponse,
@@ -36,6 +43,7 @@ import type {
 import {
 	AUTH_BROKER_CAPABILITIES_HEADER,
 	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_EXACT_USAGE_V1,
 	AUTH_BROKER_CAPABILITY_SOURCE_IDENTITY_V1,
 	DEFAULT_AUTH_BROKER_BIND,
 	DEFAULT_REFRESH_INTERVAL_MS,
@@ -51,6 +59,17 @@ import {
 	credentialDisableRequestSchema,
 	credentialUploadRequestSchema,
 } from "./wire-schemas";
+
+// Not in wire-schemas.ts: that module's export set is pinned by the public wire-schema contract test.
+/** `POST /v1/usage/exact` request: metadata identity of one native row, nothing else. */
+const exactUsageRequestSchema = type({
+	"+": "reject",
+	provider: "'anthropic'",
+	storeNamespace: type("string").atLeastLength(1),
+	nativeRowId: "number.integer >= 1",
+	modelId: type("string").atLeastLength(1).atMostLength(256).or("null"),
+	baseUrl: type("string").atLeastLength(1).atMostLength(2048),
+});
 
 const DEFAULT_EXTERNAL_CHANGE_POLL_MS = 250;
 const AUTH_RECOVERY_REFRESH_OPTIONS = { reuseRecentMint: true } as const;
@@ -85,6 +104,8 @@ export interface AuthBrokerServerOptions {
 	 * Internal-only — tests use a short interval. Default 250ms.
 	 */
 	externalChangePollMs?: number;
+	/** Clock for exact-usage observation time. Internal-only; tests inject it. Default `Date.now`. */
+	nowMs?: () => number;
 }
 
 export interface AuthBrokerServerHandle {
@@ -119,6 +140,7 @@ function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
 interface ClientFlavour {
 	codexMeterBlockScopes: boolean;
 	sourceIdentity: boolean;
+	exactUsage: boolean;
 }
 
 function clientFlavour(req: Request): ClientFlavour {
@@ -131,6 +153,7 @@ function clientFlavour(req: Request): ClientFlavour {
 	return {
 		codexMeterBlockScopes: advertised.has(AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES),
 		sourceIdentity: advertised.has(AUTH_BROKER_CAPABILITY_SOURCE_IDENTITY_V1),
+		exactUsage: advertised.has(AUTH_BROKER_CAPABILITY_EXACT_USAGE_V1),
 	};
 }
 
@@ -178,6 +201,7 @@ const STATIC_ROUTES: Record<string, true> = {
 	"/v1/snapshot/stream": true,
 	"/v1/snapshot": true,
 	"/v1/usage": true,
+	"/v1/usage/exact": true,
 	"/v1/usage/history": true,
 	"/v1/usage/observed": true,
 	"/v1/usage/clients": true,
@@ -900,6 +924,36 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						logger.warn("auth-broker usage fetch failed", { peer, error: message });
 						return json(502, { error: message });
 					}
+				}
+				if (req.method === "POST" && pathname === "/v1/usage/exact") {
+					const flavour = clientFlavour(req);
+					const parsed = await parseBody(req, exactUsageRequestSchema);
+					if (!parsed.ok) return parsed.response;
+					const identity = parsed.data as ExactUsageRequest;
+					const unknown = (code: RoutingExactUsageUnknownCode): Response =>
+						json(200, { ...identity, status: "unknown", code } satisfies ExactUsageResponse);
+					// Both capabilities are required: the namespace names the row, exact-usage-v1 names the operation.
+					if (!flavour.exactUsage || !flavour.sourceIdentity) return unknown("unsupported");
+					// The owner resolves the exact row and issues the one provider request; the caller only names it.
+					const result = await opts.storage.usage.refreshRoutingObservation({
+						accountRef: { storeNamespace: identity.storeNamespace, nativeRowId: identity.nativeRowId },
+						provider: identity.provider,
+						modelId: identity.modelId,
+						baseUrl: identity.baseUrl,
+						signal: req.signal,
+						nowMs: (opts.nowMs ?? Date.now)(),
+					});
+					logger.info("auth-broker exact usage served", {
+						peer,
+						nativeRowId: identity.nativeRowId,
+						outcome: result.kind === "observed" ? "observed" : result.code,
+					});
+					if (result.kind === "unknown") return unknown(result.code);
+					return json(200, {
+						...identity,
+						status: "observed",
+						observation: result.observation,
+					} satisfies ExactUsageResponse);
 				}
 				if (req.method === "GET" && pathname === "/v1/usage/history") {
 					const sinceMsRaw = url.searchParams.get("sinceMs");
