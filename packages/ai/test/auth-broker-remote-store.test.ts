@@ -1,21 +1,26 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import {
+	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CLIENT_CAPABILITIES,
 	AuthBrokerClient,
 	type AuthBrokerServerHandle,
 	discoverAuthStorage,
 	type FetchSnapshotResult,
 	RemoteAuthCredentialStore,
 	type SnapshotResponse,
+	type SnapshotStreamEvent,
 	startAuthBroker,
 } from "@oh-my-pi/pi-ai/auth-broker";
 import { removeWithRetries } from "../../utils/src/temp";
 import { withEnv } from "./helpers";
 
 const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
+const AUTH_BROKER_MODULE = path.resolve(import.meta.dir, "../src/auth-broker/index.ts");
 const savedEnv: Partial<Record<(typeof ANTHROPIC_ENV)[number], string | undefined>> = {};
 
 function mintOAuthCredential(suffix: string, expires: number) {
@@ -52,7 +57,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			delete process.env[key];
 		}
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "auth-broker-remote-store-"));
-		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		store = new SqliteAuthCredentialStore(new Database(":memory:"));
 		await store.saveOAuth("anthropic", mintOAuthCredential("a", Date.now() + 60_000));
 		storage = new AuthStorage(store);
 		await storage.credentials.reload();
@@ -178,18 +183,15 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			expect(await gatewayStorage.credentials.poll()).toBe(true);
 			expect(await gatewayStorage.credentials.poll()).toBe(false);
 
-			// Stop the broker, replace its persisted credential set, and boot a
-			// fresh AuthStorage whose in-memory generation starts below the
-			// client's previously acknowledged value.
+			// Stop the broker and boot a replacement over a different credential
+			// set whose AuthStorage generation starts below the client's
+			// previously acknowledged value.
 			const brokerUrl = new URL(handle!.url);
 			const bind = `${brokerUrl.hostname}:${brokerUrl.port}`;
 			await handle!.close();
 			storage!.close();
 
-			store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
-			for (const provider of ["anthropic", "deepseek", "openai", "xai"]) {
-				await store.deleteProvider(provider);
-			}
+			store = new SqliteAuthCredentialStore(new Database(":memory:"));
 			await store.saveApiKey("google", "sk-restarted");
 			storage = new AuthStorage(store);
 			await storage.credentials.reload();
@@ -343,6 +345,43 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 				cacheReadTokens: 0,
 				cacheWriteTokens: 0,
 				costUsd: 0.05,
+			},
+		]);
+	});
+
+	test("a process that quits before the flush interval still reports its observed usage", async () => {
+		// Mirrors `omp -p`: one turn, then postmortem.quit() well inside the default 10s flush interval.
+		const script = [
+			'import { postmortem } from "@oh-my-pi/pi-utils";',
+			`import { AuthBrokerClient, RemoteAuthCredentialStore } from ${JSON.stringify(AUTH_BROKER_MODULE)};`,
+			`const client = new AuthBrokerClient({ url: ${JSON.stringify(handle!.url)}, token: ${JSON.stringify(token)} });`,
+			"const remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });",
+			"remote.recordObservedUsage(",
+			'	[{ at: Date.now(), provider: "anthropic", model: "claude-x", requests: 1, inputTokens: 12, outputTokens: 4, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0.01 }],',
+			'	{ installId: "print-mode-install", hostname: "print-mode-host", app: "omp" },',
+			");",
+			"await postmortem.quit(0);",
+		].join("\n");
+		const child = Bun.spawn([process.execPath, "--eval", script], {
+			cwd: import.meta.dir,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+		expect(exitCode, stderr).toBe(0);
+
+		const reported = storage!.usage.clientSummary(0).clients.find(c => c.installId === "print-mode-install");
+		expect(reported?.providers).toEqual([
+			{
+				app: "omp",
+				provider: "anthropic",
+				requests: 1,
+				inputTokens: 12,
+				outputTokens: 4,
+				cacheReadTokens: 0,
+				cacheWriteTokens: 0,
+				costUsd: 0.01,
 			},
 		]);
 	});
@@ -520,6 +559,64 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			},
 		);
 	});
+	test("negotiated clients get the store namespace in snapshots and deltas; legacy clients get none and stay unsupported", async () => {
+		const brokerNamespace = store!.routingSourceIdentity();
+		expect(brokerNamespace.status).toBe("supported");
+		const auth = { Authorization: `Bearer ${token}` };
+
+		const legacyBody = (await (
+			await fetch(`${handle!.url}/v1/snapshot`, { headers: auth })
+		).json()) as SnapshotResponse;
+		expect(legacyBody.storeNamespace).toBeUndefined();
+		const negotiatedBody = (await (
+			await fetch(`${handle!.url}/v1/snapshot`, {
+				headers: { ...auth, [AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CLIENT_CAPABILITIES },
+			})
+		).json()) as SnapshotResponse;
+		expect(negotiatedBody.storeNamespace).toBe(brokerNamespace.storeNamespace!);
+
+		remote = new RemoteAuthCredentialStore({ client: new AuthBrokerClient({ url: handle!.url, token }) });
+		await waitUntil(() => remote!.snapshot.credentials.length === 1);
+		expect(remote.routingSourceIdentity()).toEqual(brokerNamespace);
+		// A delta must carry the same namespace or the client would have re-baselined away from this row set.
+		await storage!.credentials.upsert("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		await waitUntil(() => remote!.snapshot.credentials.length === 2);
+		expect(remote.snapshot.storeNamespace).toBe(brokerNamespace.storeNamespace!);
+		const refs = new AuthStorage(remote);
+		await refs.credentials.reload();
+		expect(refs.credentials.routingIdentities({ provider: "anthropic" }).accounts.map(a => a.ref)).toEqual(
+			remote.snapshot.credentials.map(entry => ({
+				storeNamespace: brokerNamespace.storeNamespace!,
+				nativeRowId: entry.id,
+			})),
+		);
+		remote.close();
+
+		const legacyFetch: typeof fetch = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit) => {
+				const headers = new Headers(init?.headers);
+				headers.delete(AUTH_BROKER_CAPABILITIES_HEADER);
+				return fetch(input, { ...init, headers });
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		remote = new RemoteAuthCredentialStore({
+			client: new AuthBrokerClient({ url: handle!.url, token, fetchImpl: legacyFetch }),
+		});
+		await waitUntil(() => remote!.snapshot.credentials.length === 2);
+		expect(remote.snapshot.storeNamespace).toBeUndefined();
+		expect(remote.routingSourceIdentity()).toEqual({
+			status: "unsupported",
+			storeNamespace: null,
+			reason: "namespace_unavailable",
+		});
+		const legacyStorage = new AuthStorage(remote);
+		await legacyStorage.credentials.reload();
+		const legacyCatalog = legacyStorage.credentials.routingIdentities({ provider: "anthropic" });
+		expect(legacyCatalog.accounts).toEqual([]);
+		// Ordinary broker behavior is unchanged: the rows stay usable.
+		expect(legacyStorage.credentials.list("anthropic")).toHaveLength(2);
+	});
 });
 
 /**
@@ -562,6 +659,80 @@ class FakeBrokerClient {
 		return { status: 200, snapshot: this.current, generation: this.current.generation };
 	}
 }
+
+/** Stream-only broker stand-in: each connection replays its scripted frames, then parks until aborted. */
+class ScriptedStreamClient {
+	connections = 0;
+	constructor(readonly scripts: SnapshotStreamEvent[][]) {}
+	async fetchSnapshot(): Promise<FetchSnapshotResult> {
+		throw new Error("long-poll not used when streaming");
+	}
+	async *openSnapshotStream(opts: { signal?: AbortSignal } = {}): AsyncGenerator<SnapshotStreamEvent> {
+		const script = this.scripts[Math.min(this.connections, this.scripts.length - 1)] ?? [];
+		this.connections += 1;
+		for (const event of script) yield event;
+		const parked = Promise.withResolvers<void>();
+		opts.signal?.addEventListener("abort", () => parked.resolve(), { once: true });
+		await parked.promise;
+	}
+}
+
+describe("RemoteAuthCredentialStore namespace continuity", () => {
+	const NS_A = "11111111-1111-4111-8111-111111111111";
+	const NS_B = "22222222-2222-4222-8222-222222222222";
+	const schedule = { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: 0 };
+
+	test("a delta from a different namespace is dropped and the client re-baselines on a fresh snapshot", async () => {
+		const first = { ...buildApiKeySnapshot(1, [{ id: 1, provider: "deepseek", key: "k1" }]), storeNamespace: NS_A };
+		const replaced = {
+			...buildApiKeySnapshot(1, [{ id: 9, provider: "deepseek", key: "k9" }]),
+			storeNamespace: NS_B,
+		};
+		const foreignEntry = {
+			kind: "entry" as const,
+			storeNamespace: NS_B,
+			generation: 2,
+			serverNowMs: 1,
+			refresher: schedule,
+			entry: { ...buildApiKeySnapshot(2, [{ id: 2, provider: "deepseek", key: "k2" }]).credentials[0]! },
+		};
+		const client = new ScriptedStreamClient([
+			[{ kind: "snapshot", ...first }, foreignEntry],
+			[{ kind: "snapshot", ...replaced }],
+		]);
+		const store = new RemoteAuthCredentialStore({
+			client: client as unknown as AuthBrokerClient,
+			initialSnapshot: first,
+		});
+		try {
+			await waitUntil(() => client.connections >= 2 && store.routingSourceIdentity().storeNamespace === NS_B);
+			// The foreign row 2 never entered the set; the replacement namespace owns the pool now.
+			expect(store.snapshot.credentials.map(entry => entry.id)).toEqual([9]);
+		} finally {
+			store.close();
+		}
+	});
+
+	test("an account-pool filter marks the listing incomplete without dropping the namespace", () => {
+		const snapshot = {
+			...buildApiKeySnapshot(1, [{ id: 1, provider: "deepseek", key: "k1" }]),
+			storeNamespace: NS_A,
+		};
+		const filtered = new RemoteAuthCredentialStore({
+			client: new FakeBrokerClient(snapshot) as unknown as AuthBrokerClient,
+			initialSnapshot: snapshot,
+			streamSnapshots: false,
+			backgroundIdleMs: 0,
+			accountPool: new Map([["deepseek", new Set<string>()]]),
+		});
+		try {
+			expect(filtered.routingListingComplete()).toBe(false);
+			expect(filtered.routingSourceIdentity().storeNamespace).toBe(NS_A);
+		} finally {
+			filtered.close();
+		}
+	});
+});
 
 describe("RemoteAuthCredentialStore.pollExternalChanges content revision", () => {
 	test("detects a replaced credential even when the broker generation repeats", async () => {

@@ -58,8 +58,10 @@ function orgCredential(args: {
 function readIdentityRows(dbPath: string): Array<{ identity_key: string | null; disabled_cause: string | null }> {
 	const db = new Database(dbPath, { readonly: true });
 	try {
+		// `query()` statements are finalized by `close()`; a leaked `prepare()`
+		// statement keeps the file open on Windows and breaks temp-dir cleanup.
 		return db
-			.prepare(
+			.query(
 				"SELECT identity_key, disabled_cause FROM auth_credentials WHERE provider = 'anthropic' ORDER BY id ASC",
 			)
 			.all() as Array<{ identity_key: string | null; disabled_cause: string | null }>;
@@ -110,6 +112,35 @@ describe("anthropic org-scoped credential identity", () => {
 		if (teamRow?.credential.type === "oauth") {
 			expect(teamRow.credential.access).toBe("access-team-renewed");
 		}
+	});
+
+	it("exposes two orgs of one account as distinct refs that survive a restart", async () => {
+		if (!store) throw new Error("test setup failed");
+
+		await store.upsertAuthCredential(
+			"anthropic",
+			orgCredential({ suffix: "team", orgId: TEAM_ORG, orgName: "Team" }),
+		);
+		await store.upsertAuthCredential("anthropic", orgCredential({ suffix: "max", orgId: MAX_ORG, orgName: "Max" }));
+		const storage = new AuthStorage(store);
+		await storage.credentials.reload();
+		const first = storage.credentials.routingIdentities({ provider: "anthropic" });
+
+		expect(
+			first.accounts.map(account => [account.ref.nativeRowId, account.organizationId, account.organizationName]),
+		).toEqual([
+			[1, TEAM_ORG, "Team"],
+			[2, MAX_ORG, "Max"],
+		]);
+		expect(new Set(first.accounts.map(account => account.accountId))).toEqual(new Set(["account-shared"]));
+
+		store.close();
+		store = await SqliteAuthCredentialStore.open(dbPath);
+		const reopened = new AuthStorage(store);
+		await reopened.credentials.reload();
+		expect(reopened.credentials.routingIdentities({ provider: "anthropic" }).accounts.map(a => a.ref)).toEqual(
+			first.accounts.map(a => a.ref),
+		);
 	});
 
 	it("upgrades a legacy email-keyed row on the first org-scoped login with the same email", async () => {

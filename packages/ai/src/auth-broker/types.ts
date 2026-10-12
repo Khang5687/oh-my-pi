@@ -37,6 +37,8 @@ export type SnapshotEntry = AuthCredentialSnapshotEntry & {
 
 /** GET /v1/snapshot response body. */
 export interface SnapshotResponse extends Omit<AuthCredentialSnapshot, "credentials"> {
+	/** Opaque source namespace; sent only to peers that advertise `source-identity-v1`. */
+	storeNamespace?: string;
 	serverNowMs: number;
 	refresher: RefresherSchedule;
 	credentials: SnapshotEntry[];
@@ -144,6 +146,7 @@ export interface SnapshotStreamSnapshotEvent extends SnapshotResponse {
 /** Single credential added/changed (upsert or refresh). */
 export interface SnapshotStreamEntryEvent {
 	kind: "entry";
+	storeNamespace?: string;
 	generation: number;
 	serverNowMs: number;
 	refresher: RefresherSchedule;
@@ -153,6 +156,7 @@ export interface SnapshotStreamEntryEvent {
 /** Single credential disabled/deleted. */
 export interface SnapshotStreamRemovedEvent {
 	kind: "removed";
+	storeNamespace?: string;
 	generation: number;
 	serverNowMs: number;
 	refresher: RefresherSchedule;
@@ -173,6 +177,15 @@ export const AUTH_BROKER_CAPABILITIES_HEADER = "OMP-Auth-Broker-Capabilities";
 
 /** Client understands independent Codex `chat` and `spark` credential-block scopes. */
 export const AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES = "codex-meter-block-scopes";
+
+/** Client understands the optional `storeNamespace` on snapshots and stream deltas. */
+export const AUTH_BROKER_CAPABILITY_SOURCE_IDENTITY_V1 = "source-identity-v1";
+
+/** Value of {@link AUTH_BROKER_CAPABILITIES_HEADER} sent by current clients. */
+export const AUTH_BROKER_CLIENT_CAPABILITIES = [
+	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
+	AUTH_BROKER_CAPABILITY_SOURCE_IDENTITY_V1,
+].join(",");
 
 /** Default port when none is configured. Loopback-only, no external exposure. */
 export const DEFAULT_AUTH_BROKER_BIND = "127.0.0.1:8765";

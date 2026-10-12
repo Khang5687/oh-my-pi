@@ -61,6 +61,8 @@ export interface JobSnapshot {
 	resolvedThinkingLevel?: ConfiguredThinkingLevel;
 	/** True when the task progress reports an attached live advisor. */
 	advisor?: boolean;
+	/** The task agent's latest self-estimated completion (0–100); see `AgentProgress.completionPercent`. */
+	completionPercent?: number;
 	resultText?: string;
 	errorText?: string;
 	/** Source-output metadata retained for per-job warnings and persisted row rendering. */
@@ -273,6 +275,39 @@ function jobsRenderResult(
 	});
 
 	let cached: RenderCache | undefined;
+	// Per-job preview rows are invariant across spinner/shimmer frames (the job
+	// snapshots are frozen for this result), so the envelope strip, flatten and
+	// wrap run once per (job, expanded, width) instead of every animated frame.
+	const previewRows = new Map<JobSnapshot, { expanded: boolean; width: number; lines: readonly string[] }>();
+	const jobPreviewRows = (job: JobSnapshot, expanded: boolean, continuationWidth: number): readonly string[] => {
+		const hit = previewRows.get(job);
+		if (hit !== undefined && hit.expanded === expanded && hit.width === continuationWidth) return hit.lines;
+		const artifactError = job.meta?.artifactError ?? job.artifactError;
+		// Legacy rows did not retain full metadata. Strip the known warning
+		// footer so the dedicated row/root warning remains the only copy.
+		const previewError =
+			artifactError ?? (outputMeta?.source?.type !== "report" ? outputMeta?.artifactError : undefined);
+		const previewMeta = job.meta ?? (previewError ? { artifactError: previewError } : undefined);
+		const preview = flattenStructuredPreview(
+			stripTaskResultEnvelope(
+				stripOutputNotice(job.errorText?.trim() || job.resultText?.trim() || "", previewMeta).trim(),
+			),
+		);
+		const lines: string[] = [];
+		if (preview) {
+			const maxLines = expanded ? PREVIEW_LINES_EXPANDED : PREVIEW_LINES_COLLAPSED;
+			const previewLines = getPreviewLines(
+				preview,
+				maxLines,
+				Math.min(PREVIEW_LINE_WIDTH, continuationWidth),
+				Ellipsis.Unicode,
+			);
+			const tone = job.errorText ? "error" : "dim";
+			for (const pl of previewLines) lines.push(`  ${uiTheme.fg(tone, pl)}`);
+		}
+		previewRows.set(job, { expanded, width: continuationWidth, lines });
+		return lines;
+	};
 	return {
 		render(width: number): readonly string[] {
 			const expanded = options.expanded;
@@ -309,7 +344,11 @@ function jobsRenderResult(
 							job.status === "running" ? options.spinnerFrame : undefined,
 						)}${job.exitCode === undefined ? "" : `${uiTheme.sep.dot}${uiTheme.fg(job.exitCode === 0 ? "muted" : "error", `exit ${job.exitCode}`)}`}`;
 						const typeBadge = formatBadge(job.type, statusToColor(job.status), uiTheme);
-						const durationSuffix = `${uiTheme.sep.dot}${uiTheme.fg("dim", formatDuration(job.durationMs))}`;
+						const completion =
+							job.status === "running" && job.completionPercent !== undefined
+								? `${uiTheme.sep.dot}${uiTheme.fg("accent", `${job.completionPercent}%`)}`
+								: "";
+						const durationSuffix = `${completion}${uiTheme.sep.dot}${uiTheme.fg("dim", formatDuration(job.durationMs))}`;
 						const displayId = truncateToWidth(
 							replaceTabs(job.id).replace(/\s+/g, " "),
 							Math.max(0, rowWidth - visibleWidth(`${icon} ${typeBadge} ${durationSuffix}`)),
@@ -371,30 +410,7 @@ function jobsRenderResult(
 							);
 						}
 
-						// Legacy rows did not retain full metadata. Strip the known warning
-						// footer so the dedicated row/root warning remains the only copy.
-						const previewError =
-							artifactError ?? (outputMeta?.source?.type !== "report" ? outputMeta?.artifactError : undefined);
-						const previewMeta = job.meta ?? (previewError ? { artifactError: previewError } : undefined);
-
-						const preview = flattenStructuredPreview(
-							stripTaskResultEnvelope(
-								stripOutputNotice(job.errorText?.trim() || job.resultText?.trim() || "", previewMeta).trim(),
-							),
-						);
-						if (preview) {
-							const maxLines = expanded ? PREVIEW_LINES_EXPANDED : PREVIEW_LINES_COLLAPSED;
-							const previewLines = getPreviewLines(
-								preview,
-								maxLines,
-								Math.min(PREVIEW_LINE_WIDTH, continuationWidth),
-								Ellipsis.Unicode,
-							);
-							const tone = job.errorText ? "error" : "dim";
-							for (const pl of previewLines) {
-								lines.push(`  ${uiTheme.fg(tone, pl)}`);
-							}
-						}
+						for (const previewLine of jobPreviewRows(job, expanded, continuationWidth)) lines.push(previewLine);
 						return lines;
 					},
 				},
@@ -601,11 +617,19 @@ function describeJob(job: JobSnapshot, isPartial: boolean): NativeNode {
 		{ role: "omp.wait.job", tone },
 		compact([
 			row(
-				[
+				compact([
 					node("badge", { text: job.type, tone }),
 					text(spans, { truncate: "end", grow: 1 }),
+					job.status === "running" && job.completionPercent !== undefined
+						? node("progress", {
+								value: job.completionPercent / 100,
+								label: `${job.completionPercent}%`,
+								tone: "accent",
+								title: "Agent's own completion estimate",
+							})
+						: undefined,
 					elapsed(job.durationMs, !running),
-				],
+				]),
 				{ gap: "sm" },
 			),
 			artifactError && text([span(formatArtifactErrorNotice(artifactError), "warning")], { wrap: "word" }),

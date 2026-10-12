@@ -15,7 +15,7 @@ import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import { getKimiCommonHeaders } from "../registry/oauth/kimi";
-import { getEnvApiKey } from "../stream";
+import { getEnvApiKey } from "../env-api-key";
 import type {
 	AssistantMessage,
 	Context,
@@ -1136,7 +1136,14 @@ const streamOpenAICompletionsOnce = (
 				// Same as appendText: leave toolCall blocks pending so index-only
 				// continuation deltas can still find them.
 				if (currentBlock?.type !== "toolCall") finishCurrentBlock(currentBlock);
-				const block: ThinkingContent = { type: "thinking", thinking: "", thinkingSignature: signature };
+				// The wire marks no summaries here; `portable-reasoning` vouches per
+				// family that this text is the full trace.
+				const block: ThinkingContent = {
+					type: "thinking",
+					thinking: "",
+					thinkingSignature: signature,
+					summary: false,
+				};
 				currentBlock = block;
 				pushContentBlock(block);
 				stream.push({ type: "thinking_start", contentIndex: blockIndex(block), partial: output });
@@ -1336,6 +1343,7 @@ const streamOpenAICompletionsOnce = (
 				// and release the socket immediately (a queued `.return()` alone
 				// would wait on the never-arriving next chunk).
 				onGraceEnd: () => requestAbortController.abort(),
+				awaitDrainOnReturn: options?.waitForTerminalDrain,
 			});
 			for await (const chunk of terminalAwareStream) {
 				if (!chunk || typeof chunk !== "object") continue;
@@ -1380,6 +1388,8 @@ const streamOpenAICompletionsOnce = (
 					// Trailing usage-only chunk (`stream_options.include_usage`) after
 					// `finish_reason`: the response is complete — stop pulling instead
 					// of waiting for `[DONE]`/close from hosts that never send either.
+					// `iterateWithTerminalGrace` drains the tail in the background so
+					// compliant hosts still get to relay `[DONE]` before the socket closes.
 					if (streamFinishedAt !== undefined && sawUsagePayload) break;
 					continue;
 				}

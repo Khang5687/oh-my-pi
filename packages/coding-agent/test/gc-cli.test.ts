@@ -10,7 +10,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { BlobStore, blobStagingPath } from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { FileSessionStorage, sessionStagingPath } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import {
 	getAgentDir,
 	getBlobsDir,
@@ -776,6 +776,61 @@ describe("runGcCommand history checkpoint", () => {
 	}, 10_000);
 });
 
+describe("runGcCommand session staging sweep", () => {
+	test("removes rewrite temps abandoned by killed writers, keeping in-flight and unrelated ones", async () => {
+		const live = await writeSession(root, "project", "live", "pending");
+		const abandoned = sessionStagingPath(live);
+		const inFlight = sessionStagingPath(live);
+		// Subagent transcripts nest inside the parent's artifacts directory.
+		const nestedAbandoned = sessionStagingPath(path.join(live.slice(0, -".jsonl".length), "0-sub.jsonl"));
+		// An extensionless `--session` transcript outside the sessions tree, known only to the registry.
+		const externalDir = path.join(root, "external-sessions");
+		const externalFile = path.join(externalDir, "work");
+		await Bun.write(externalFile, "{}\n");
+		await Bun.write(path.join(getCustomSessionFilesDir(root), "session-1"), externalFile);
+		const externalAbandoned = sessionStagingPath(externalFile);
+		const unrelated = path.join(externalDir, ".notes.0123456789abcdef.tmp");
+		for (const file of [abandoned, nestedAbandoned, externalAbandoned, unrelated]) {
+			await Bun.write(file, "partial");
+			await agePath(file);
+		}
+		await Bun.write(inFlight, "partial");
+		const flags = { agentDir: root, archive: true };
+
+		const dryRun = await runGcCommand({ flags });
+		expect(dryRun.archive).toMatchObject({ wouldDeleteTemps: 3, deletedTemps: 0, tempBytes: 21 });
+		expect(await Bun.file(abandoned).exists()).toBe(true);
+
+		const applied = await runGcCommand({ flags: { ...flags, apply: true } });
+		expect(applied.archive).toMatchObject({ wouldDeleteTemps: 3, deletedTemps: 3, errors: [] });
+		for (const removed of [abandoned, nestedAbandoned, externalAbandoned]) {
+			expect(await Bun.file(removed).exists()).toBe(false);
+		}
+		for (const kept of [live, inFlight, externalFile, unrelated]) {
+			expect(await Bun.file(kept).exists()).toBe(true);
+		}
+	});
+	test("sweeps the first-save temp of a missing registered session before its stale marker is pruned", async () => {
+		const target = path.join(root, "external-sessions", "first-save");
+		const marker = path.join(getCustomSessionFilesDir(root), "first-save");
+		await Bun.write(marker, target);
+		await agePath(marker, 2);
+		const abandoned = sessionStagingPath(target);
+		await Bun.write(abandoned, "partial");
+		await agePath(abandoned);
+
+		const result = await runGcCommand({
+			flags: { agentDir: root, archive: true, stale: true, apply: true },
+		});
+
+		expect(result.archive).toMatchObject({ wouldDeleteTemps: 1, deletedTemps: 1, errors: [] });
+		expect(result.stale?.danglingMarkers).toBe(1);
+		expect(await Bun.file(marker).exists()).toBe(false);
+		expect(await Bun.file(abandoned).exists()).toBe(false);
+		expect(await Bun.file(target).exists()).toBe(false);
+	});
+});
+
 describe("runGcCommand cold-session archive", () => {
 	test("archives old completed sessions while honoring keep-count and active-status skips", async () => {
 		const archiveMe = await writeSession(root, "project", "archive-me", "complete", { ageDays: 90 });
@@ -1073,6 +1128,36 @@ describe("runGcCommand cold-session archive", () => {
 
 		const check = new Database(dbPath);
 		const rows = check.query("SELECT session_id FROM session_recaps").all() as Array<{ session_id: string }>;
+		check.close();
+
+		expect(result.archive?.archived).toBe(1);
+		expect(result.archive?.errors).toEqual([]);
+		expect(rows.map(row => row.session_id)).toEqual(["keep-me"]);
+	});
+
+	test("removes archived session titles even when history.db has no prompt history", async () => {
+		await writeSession(root, "project", "archive-me", "complete", { ageDays: 90 });
+		const dbPath = getHistoryDbPath(root);
+		await fs.mkdir(path.dirname(dbPath), { recursive: true });
+		const db = new Database(dbPath);
+		db.run("CREATE TABLE session_titles (session_id TEXT PRIMARY KEY, title TEXT NOT NULL)");
+		db.run("INSERT INTO session_titles (session_id, title) VALUES ('archive-me', 'old title')");
+		db.run("INSERT INTO session_titles (session_id, title) VALUES ('keep-me', 'live title')");
+		db.close();
+
+		const result = await runGcCommand({
+			flags: {
+				agentDir: root,
+				archive: true,
+				coldArchiveAfterDays: 30,
+				retainNewestGlobal: 0,
+				retainNewestPerCwd: 0,
+				apply: true,
+			},
+		});
+
+		const check = new Database(dbPath);
+		const rows = check.query("SELECT session_id FROM session_titles").all() as Array<{ session_id: string }>;
 		check.close();
 
 		expect(result.archive?.archived).toBe(1);
@@ -2403,12 +2488,20 @@ describe("runGcCommand stale state", () => {
 		const agentDir = path.join(root, "agent");
 		const collabDir = path.join(root, "collab");
 		const resumed = await writeAged(collabDir, "room-resumed.jsonl", "{}\n", 60);
-		const held = await writeAged(collabDir, "room-held.jsonl", "{}\n", 60);
+		// Unique per run: the lease is machine-wide, so a fixed id would contend
+		// with the same test running concurrently elsewhere.
+		const heldId = Bun.randomUUIDv7();
+		const held = await writeAged(
+			collabDir,
+			"room-held.jsonl",
+			`${JSON.stringify({ type: "session", id: heldId, timestamp: new Date().toISOString(), cwd: root })}\n`,
+			60,
+		);
 		const idle = await writeAged(collabDir, "room-idle.jsonl", "{}\n", 60);
 		// `--continue` in this terminal reopens the replica it last switched to.
 		await writeAged(getTerminalSessionsDir(agentDir), "tty-guest", `${root}\n${resumed}\n`);
-		// A live guest writing its replica holds the session ownership lease.
-		const release = new FileSessionStorage().claimSessionFile(held);
+		// A live guest writing its replica holds the session's ownership lease.
+		const release = new FileSessionStorage().claimSession(heldId, held);
 		if (!release) throw new Error("Expected to claim the replica lease");
 		let result: GcResult;
 		try {

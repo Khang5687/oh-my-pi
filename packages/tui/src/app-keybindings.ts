@@ -37,6 +37,7 @@ interface AppKeybindings {
 	"app.model.selectTemporary": true;
 	"app.tools.expand": true;
 	"app.tools.toggleVisibility": true;
+	"app.ask.hide": true;
 	"app.editor.external": true;
 	"app.message.followUp": true;
 	"app.retry": true;
@@ -60,6 +61,7 @@ interface AppKeybindings {
 	"app.tree.unfoldOrDown": true;
 	"app.plan.toggle": true;
 	"app.history.search": true;
+	"app.stt.pushToTalk": true;
 	"app.stt.toggle": true;
 	"app.live.toggle": true;
 }
@@ -136,6 +138,10 @@ export const KEYBINDINGS = {
 	"app.tools.toggleVisibility": {
 		defaultKeys: "ctrl+shift+o",
 		description: "Show or hide tool activity",
+	},
+	"app.ask.hide": {
+		defaultKeys: "alt+h",
+		description: "Hide or show a pending ask dialog",
 	},
 	"app.editor.external": {
 		defaultKeys: "ctrl+g",
@@ -237,9 +243,13 @@ export const KEYBINDINGS = {
 		defaultKeys: "ctrl+r",
 		description: "Search history",
 	},
+	"app.stt.pushToTalk": {
+		defaultKeys: "space",
+		description: "Hold to record speech-to-text",
+	},
 	"app.stt.toggle": {
 		defaultKeys: [],
-		description: "Toggle speech-to-text (default gesture: hold Space)",
+		description: "Toggle speech-to-text recording",
 	},
 	"app.live.toggle": {
 		defaultKeys: "ctrl+l",

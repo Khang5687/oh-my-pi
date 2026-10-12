@@ -140,6 +140,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"qwen-preserve-thinking": wire("qwenPreserveThinking", ["openai"]),
 	"reject-root-object-union": wire("rejectRootObjectUnion", OAI),
 	"retry-without-strict-on-grammar-error": wire("retryWithoutStrictOnGrammarError", OAI),
+	"session-header": wire("sessionHeader", OAI, "scalar", ["x-litellm-session-id"]),
 	"reasoning-content-field": wire("reasoningContentField", OAI, "scalar", [
 		"reasoning_content",
 		"reasoning",
@@ -169,6 +170,8 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"requires-thinking-as-text": wire("requiresThinkingAsText", ["openai"]),
 	"requires-tool-result-name": wire("requiresToolResultName", ["openai"]),
 	"strict-responses-pairing": wire("strictResponsesPairing", ["openai-responses"]),
+	"connection-bound-native-history": wire("connectionBoundNativeHistory", ["openai-responses"]),
+	"stateful-responses": wire("statefulResponses", ["openai-responses"]),
 	"requires-reasoning-off-juice-instruction": wire("requiresReasoningOffJuiceInstruction", ["openai-responses"]),
 	"supports-all-turns-reasoning-context": wire("supportsAllTurnsReasoningContext", ["openai-responses"]),
 	"supports-configuration-update": wire("supportsConfigurationUpdate", ["openai-responses"]),
@@ -194,6 +197,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"supports-reasoning-effort": wire("supportsReasoningEffort", OAI),
 	"supports-reasoning-params": wire("supportsReasoningParams", OAI),
 	"supports-reasoning-summary": wire("supportsReasoningSummary", ["openai-responses"]),
+	"store-responses": wire("storeResponses", ["openai-responses"]),
 	"supports-store": wire("supportsStore", ["openai"]),
 	"supports-strict-mode": wire("supportsStrictMode", OAI),
 	"supports-tool-choice": wire("supportsToolChoice", OAI),
@@ -227,12 +231,20 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"allow-anthropic-header-overrides": wire("allowAnthropicHeaderOverrides", ["anthropic"]),
 	"disable-adaptive-thinking": wire("disableAdaptiveThinking", ["anthropic"]),
 	"disable-strict-tools": wire("disableStrictTools", ["anthropic"]),
-	"disabled-thinking": wire("disabledThinking", ["anthropic"], "scalar", ["omit", "disabled", "adaptive"]),
+	"between-tools-effort": wire("betweenToolsEffort", ["anthropic"], "scalar", ["low", "medium", "high"]),
+	"disabled-thinking": wire("disabledThinking", ["anthropic", "bedrock"], "scalar", [
+		"omit",
+		"disabled",
+		"adaptive",
+		"between-tools",
+	]),
 	"effort-beta": wire("effortBeta", ["anthropic"]),
 	"escape-builtin-tool-names": wire("escapeBuiltinToolNames", ["anthropic"]),
 	"fast-mode": wire("fastMode", ["anthropic"]),
 	"first-party-provider": wire("firstPartyProvider", ["anthropic"]),
 	"inject-claude-code-instruction": wire("injectClaudeCodeInstruction", ["anthropic"]),
+	"max-image-dimension": wire("maxImageDimension", ["anthropic"]),
+	"max-image-payload-bytes": wire("maxImagePayloadBytes", ["anthropic"]),
 	"official-endpoint": wire("officialEndpoint", ["anthropic", "openai-responses"]),
 	"replay-unsigned-thinking": wire("replayUnsignedThinking", ["anthropic"]),
 	"requires-thinking-enabled": wire("requiresThinkingEnabled", ["anthropic"]),
@@ -248,7 +260,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"supports-per-message-effort": wire("supportsPerMessageEffort", ["anthropic"]),
 	"supports-server-compaction": wire("supportsServerCompaction", ["anthropic"]),
 	"supports-between-tools-thinking": wire("supportsBetweenToolsThinking", ["anthropic"]),
-	"supports-thinking-binding-controls": wire("supportsThinkingBindingControls", ["anthropic"]),
+	"supports-thinking-binding-controls": wire("supportsThinkingBindingControls", ["anthropic", "bedrock"]),
 	"supports-turn-scoped-system": wire("supportsTurnScopedSystem", ["anthropic"]),
 
 	// ── wire: bedrock-converse-stream ──
@@ -259,7 +271,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	// ── wire: devin-agent ──
 	"model-router": wire("modelRouter", ["devin"]),
 	"supports-parallel-tool-calls": wire("supportsParallelToolCalls", ["devin"]),
-	"trust-explicit-thinking-only": wire("trustExplicitThinkingOnly", ["devin"]),
+	"trust-explicit-thinking-only": wire("trustExplicitThinkingOnly", [...OAI, "devin"]),
 
 	// ── wire: google APIs ──
 	"antigravity-claude-tool-mode": wire("antigravityClaudeToolMode", ["google"]),
@@ -293,7 +305,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"stream-idle-timeout-ms": wire("streamIdleTimeoutMs", [...OAI, "anthropic", "bedrock", "google"]),
 	"strip-image-input": wire("stripImageInput", [...OAI, "anthropic", "google"]),
 	"supports-forced-tool-choice": wire("supportsForcedToolChoice", [...OAI, "anthropic", "bedrock"]),
-	"supports-sampling-params": wire("supportsSamplingParams", [...OAI, "anthropic"]),
+	"supports-sampling-params": wire("supportsSamplingParams", [...OAI, "anthropic", "bedrock", "devin", "google"]),
 	"thinking-loop-guard": wire("thinkingLoopGuard", [...OAI, "anthropic", "google"], "scalar", [
 		"gemini",
 		"deepseek",
@@ -304,7 +316,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"thinking-default-level": { key: "defaultLevel", set: "thinking", shape: "scalar", values: EFFORTS },
 	"thinking-effort-budgets": { key: "effortBudgets", set: "thinking", shape: "object" },
 	"thinking-effort-map": { key: "effortMap", set: "thinking", shape: "object" },
-	"thinking-efforts": { key: "efforts", set: "thinking", shape: "array", values: EFFORTS },
+	"thinking-efforts": { key: "efforts", set: "thinking", shape: "array", values: EFFORTS, emptyArray: true },
 	"thinking-mode": {
 		key: "mode",
 		set: "thinking",
@@ -390,12 +402,38 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	},
 	"web-search-model": { key: "webSearchModel", set: "catalog", shape: "scalar" },
 	"hosted-image": { key: "hostedImage", set: "catalog", shape: "scalar", values: [true, false] },
+	/** How the model line bills an input image; shape and formulas in `./image-tokenization`. */
+	"image-tokenization": { key: "imageTokenization", set: "catalog", shape: "object" },
 	"image-model": { key: "imageModel", set: "catalog", shape: "scalar" },
+	"inline-image-byte-budget": { key: "inlineImageByteBudget", set: "catalog", shape: "scalar" },
+	/**
+	 * Most questions one System One judgment request may carry; the judge
+	 * splits larger requests. Unassigned: the endpoint takes any batch size.
+	 */
+	"judgment-questions-max": { key: "judgmentQuestionsMax", set: "catalog", shape: "scalar" },
 	"limits-patch": { key: "limitsPatch", set: "catalog", shape: "object" },
 	"long-context-cost": { key: "longContext", set: "catalog", shape: "object" },
 	"prompt-cache": { key: "promptCache", set: "catalog", shape: "object" },
+	/**
+	 * Prompt-cache lookback in block positions: how far back from a cache
+	 * breakpoint the provider looks for an earlier request's cache entry.
+	 * Unassigned: no known lookback bound.
+	 */
+	"prompt-cache-lookback": { key: "promptCacheLookback", set: "catalog", shape: "scalar" },
 	"long-usage-limit-fallback": { key: "longUsageLimitFallback", set: "catalog", shape: "scalar" },
 	"max-context-window": { key: "maxContextWindow", set: "catalog", shape: "scalar" },
+	/**
+	 * Every host of the model returns its full plaintext trace wherever the
+	 * wire does not mark reasoning as a summary (`ThinkingContent.summary ===
+	 * false` vouches for nothing more), and its identity (class + family +
+	 * revision) pins one set of weights, so a turn's reasoning may replay
+	 * natively on another host serving the same model. Marked summaries never
+	 * carry; do not declare it where a host serves summaries unmarked.
+	 * Declared per family in `classes/*.kdl`; a host whose reasoning must not be
+	 * carried in or out sets `#false` in its `providers/*.kdl`. Read through
+	 * `compat/reasoning-carry.ts`.
+	 */
+	"portable-reasoning": { key: "portableReasoning", set: "catalog", shape: "scalar", values: [true, false] },
 	"pricing-status": {
 		key: "pricingStatus",
 		set: "catalog",

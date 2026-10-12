@@ -141,6 +141,7 @@ export const refresherScheduleSchema: FluentType<RefresherSchedule> = type({
 
 export const snapshotResponseSchema: FluentType<SnapshotResponse> = type({
 	"+": "reject",
+	"storeNamespace?": type("string").atLeastLength(1),
 	generation: "number.integer",
 	generatedAt: "number",
 	serverNowMs: "number",
@@ -158,6 +159,7 @@ export const snapshotStreamSnapshotEventSchema: FluentType<SnapshotStreamSnapsho
 	serverNowMs: "number",
 	refresher: refresherScheduleSchema,
 	credentials: snapshotEntrySchema.array(),
+	"storeNamespace?": type("string").atLeastLength(1),
 	kind: "'snapshot'",
 });
 
@@ -165,6 +167,7 @@ export const snapshotStreamSnapshotEventSchema: FluentType<SnapshotStreamSnapsho
 export const snapshotStreamEntryEventSchema: FluentType<SnapshotStreamEntryEvent> = type({
 	"+": "reject",
 	kind: "'entry'",
+	"storeNamespace?": type("string").atLeastLength(1),
 	generation: "number.integer",
 	serverNowMs: "number",
 	refresher: refresherScheduleSchema,
@@ -175,6 +178,7 @@ export const snapshotStreamEntryEventSchema: FluentType<SnapshotStreamEntryEvent
 export const snapshotStreamRemovedEventSchema: FluentType<SnapshotStreamRemovedEvent> = type({
 	"+": "reject",
 	kind: "'removed'",
+	"storeNamespace?": type("string").atLeastLength(1),
 	generation: "number.integer",
 	serverNowMs: "number",
 	refresher: refresherScheduleSchema,

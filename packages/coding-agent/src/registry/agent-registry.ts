@@ -17,13 +17,6 @@ import { MAIN_AGENT_ID, type AgentStatus, type AgentMetricsSummary } from "@oh-m
 export { MAIN_AGENT_ID };
 export type { AgentStatus, AgentMetricsSummary };
 
-/** Sidecar marker retained beside a child transcript after an explicit kill. */
-const AGENT_TOMBSTONE_SUFFIX = ".tombstone";
-
-export function getAgentTombstonePath(sessionFile: string): string {
-	return `${sessionFile}${AGENT_TOMBSTONE_SUFFIX}`;
-}
-
 /**
  * - `main`/`sub`: the user-facing agent tree (driving agent + task subagents).
  * - `advisor`: a passive review transcript persisted like a subagent for usage
@@ -56,6 +49,8 @@ export interface AgentHistorySummary {
 	/** Whether the last resolved model was selected by retry fallback routing. */
 	resolvedModelIsFallback?: boolean;
 	metrics?: AgentMetricsSummary;
+	/** Cumulative own-session assistant and model_usage cost, excluding nested task results. */
+	directCost?: number;
 	readOnly?: boolean;
 	/** Durable task output artifact, when the executor wrote one. */
 	outputPath?: string;
