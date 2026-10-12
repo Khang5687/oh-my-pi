@@ -1,7 +1,13 @@
-import { type ApiKeyResolution, type ApiKeyResolver, markAfterSiblingWait } from "@oh-my-pi/pi-ai/auth-retry";
+import {
+	type ApiKeyResolution,
+	type ApiKeyResolver,
+	ManagedDispatchRefusedError,
+	markAfterSiblingWait,
+} from "@oh-my-pi/pi-ai/auth-retry";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { isUsageLimitOutcome } from "@oh-my-pi/pi-ai/error/rate-limit";
 import type { AuthApiKeyOptions, AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
+import type { ManagedAccountRoutingAdapter } from "../modes/rpc/account-routing";
 import type { Api, Model } from "@oh-my-pi/pi-ai/types";
 
 /** Model slice accepted by the model-form `resolver(model, sessionId)` overload. */
@@ -97,4 +103,49 @@ export function createApiKeyResolver(
 		}
 		return resolveKey(true, signal, AIError.status(error) === 401 ? "auth-recovery" : undefined);
 	};
+}
+
+/**
+ * Resolver for a host-managed Claude call. The host, not the cascade, picks the account: every
+ * resolution asks the adapter for a grant, then turns that exact row into a bearer or a typed
+ * refusal. There is no sibling rotation, key fallback or environment credential. A caller that
+ * cannot carry a managed call (a bare `resolveApiKeyOnce(resolver)`) fails closed instead of
+ * silently falling back to independent auth.
+ */
+export function createManagedApiKeyResolver(
+	registry: { authStorage: AuthStorage },
+	adapter: ManagedAccountRoutingAdapter,
+	options: ApiKeyResolverOptions = {},
+): ApiKeyResolver {
+	const resolve: ApiKeyResolver = async ctx => {
+		const call = ctx.managedCall;
+		if (!call) throw new ManagedDispatchRefusedError("unsupported_runtime");
+		const grant = await adapter.acquire(call, {
+			previousOutcome: ctx.previousOutcome,
+			forceRefresh: ctx.error !== undefined,
+		});
+		const result = await registry.authStorage.routing.resolveExact({
+			accountRef: grant.accountRef,
+			modelId: call.modelId,
+			// An absent base URL is not the trusted first-party endpoint; the strict resolver refuses it.
+			baseUrl: options.baseUrl ?? "",
+			admission: grant,
+			call,
+			lifecycle: adapter,
+			signal: ctx.signal ?? call.signal,
+			// A failed attempt on row A never force-refreshes row B: only a re-grant of the same row refreshes.
+			forceRefresh: ctx.error !== undefined && adapter.refreshesSameRow(call, grant),
+		});
+		if ("refusal" in result) throw new ManagedDispatchRefusedError(result.code, result.retryAfterMs);
+		return result;
+	};
+	return Object.assign(resolve, { managedRouting: adapter });
+}
+
+/** Resolver for a metadata-only launch: no provider, Claude or otherwise, may be dispatched. */
+export function createForbiddenApiKeyResolver(adapter: ManagedAccountRoutingAdapter): ApiKeyResolver {
+	const resolve: ApiKeyResolver = () => {
+		throw new ManagedDispatchRefusedError("unsupported_runtime");
+	};
+	return Object.assign(resolve, { managedRouting: adapter });
 }

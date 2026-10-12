@@ -1,10 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { OAuthCredential, UsageReport } from "@oh-my-pi/pi-ai";
-import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
+import { beginManagedCall, ManagedDispatchRefusedError, resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
+import * as claudeUsageModule from "@oh-my-pi/pi-ai/usage/claude";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ManagedAccountRoutingAdapter } from "@oh-my-pi/pi-coding-agent/modes/rpc/account-routing";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -571,6 +573,246 @@ describe("task subagent OAuth pin inheritance", () => {
 			);
 		} finally {
 			for (const session of sessions.reverse()) await session.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
+});
+
+describe("host-owned account routing inheritance", () => {
+	const hostCommand = {
+		type: "account.routing.configure",
+		version: 1,
+		hostEpoch: "epoch-1",
+		runtimeInstanceId: "rt-1",
+		scope: "host-owned",
+		provider: "anthropic",
+		includedOnly: true,
+	} as const;
+
+	function managedAuthStorage(): AuthStorage {
+		return new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
+			usageFetch: (async () => {
+				return new Response(JSON.stringify({ five_hour: { utilization: 10 }, spend: { enabled: false } }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}) as unknown as typeof fetch,
+			usageProviderResolver: provider =>
+				provider === "anthropic" ? claudeUsageModule.claudeUsageProvider : undefined,
+		});
+	}
+
+	it("serves parent and child sessions through one host adapter, each under its own session id", async () => {
+		const tempDir = TempDir.createSync("@pi-managed-routing-inherit-");
+		const authStorage = managedAuthStorage();
+		const sessions: AgentSession[] = [];
+		try {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			const otherModel = getBundledModel("openai", "gpt-5-mini");
+			if (!model || !otherModel) throw new Error("Expected bundled test models");
+			// The usage provider only reads real-looking subscription tokens.
+			await authStorage.credentials.set(
+				"anthropic",
+				["a", "b"].map(suffix => ({ ...oauthCredential(suffix), access: `sk-ant-oat01-${suffix}` })),
+			);
+			authStorage.keys.setRuntime("openai", "openai-key");
+			const identity = authStorage.credentials.routingIdentities({ provider: "anthropic" });
+			const refOf = (accountId: string) => identity.accounts.find(account => account.accountId === accountId)!.ref;
+
+			const adapter = new ManagedAccountRoutingAdapter("model", { completeCoverage: true });
+			const frames: Array<Record<string, unknown> & { type: string }> = [];
+			adapter.attachSink(frame => {
+				frames.push(frame as never);
+				// Synthetic host: the parent session is served by account A, every other session by B.
+				if (frame.type !== "account.routing.admit.request") return;
+				queueMicrotask(() =>
+					adapter.handleControlFrame({
+						type: "account.routing.admit.response",
+						id: frame.id,
+						hostEpoch: frame.hostEpoch,
+						runtimeInstanceId: frame.runtimeInstanceId,
+						decision: {
+							kind: "admit",
+							admissionId: `adm-${frame.sessionId}`,
+							accountRef: refOf(frame.sessionId === "parent-provider-session" ? "account-a" : "account-b"),
+							selectionGeneration: 1,
+							policyRevision: 1,
+						},
+					}),
+				);
+			});
+			const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+			const settings = Settings.isolated({
+				"async.enabled": false,
+				"compaction.enabled": false,
+				"todo.enabled": false,
+			});
+			const common = {
+				cwd: tempDir.path(),
+				agentDir: tempDir.path(),
+				authStorage,
+				modelRegistry,
+				settings,
+				model,
+				toolNames: ["read"],
+				disableExtensionDiscovery: true,
+			};
+			const { session: parent } = await createAgentSession({
+				...common,
+				sessionManager: SessionManager.inMemory(tempDir.path()),
+				providerSessionId: "parent-provider-session",
+				managedAccountRouting: adapter,
+			});
+			sessions.push(parent);
+			// Host-owned startup: nothing leaves before configure, and construction did not wait for it.
+			expect(frames).toEqual([]);
+			adapter.configure(hostCommand);
+
+			// A child built on the same registry inherits the adapter without being handed it.
+			const { session: child } = await createAgentSession({
+				...common,
+				sessionManager: SessionManager.inMemory(tempDir.path()),
+				providerSessionId: "child-provider-session",
+			});
+			sessions.push(child);
+			expect(child.modelRegistry.managedRouting).toBe(adapter);
+
+			const bearers: string[] = [];
+			for (const [session, sessionId] of [
+				[parent, "parent-provider-session"],
+				[child, "child-provider-session"],
+			] as const) {
+				const resolver = await session.agent.getApiKey?.(model);
+				if (typeof resolver !== "function") throw new Error("Expected a resolver");
+				const call = beginManagedCall(resolver, { sessionId, modelId: model.id, purpose: "agent_turn" });
+				if (!call) throw new Error("Expected a managed call");
+				const resolved = await resolver({ lastChance: false, error: undefined, managedCall: call });
+				if (typeof resolved !== "object" || !resolved.managedAdmission)
+					throw new Error("Expected a managed admission");
+				bearers.push(resolved.apiKey);
+				resolved.managedAdmission.outcome({
+					startedAt: null,
+					finishedAt: Date.now(),
+					code: "cancelled",
+					dispatch: "not_dispatched",
+					replaySafe: true,
+					refusalReason: null,
+					retryAfterMs: null,
+					quotaBlocks: [],
+					windows: [],
+				});
+			}
+			expect(bearers).toEqual(["sk-ant-oat01-a", "sk-ant-oat01-b"]);
+			const requests = frames.filter(frame => frame.type === "account.routing.admit.request");
+			expect(requests.map(request => request.sessionId)).toEqual([
+				"parent-provider-session",
+				"child-provider-session",
+			]);
+			expect(new Set(requests.map(request => request.operationId)).size).toBe(2);
+			expect(frames.filter(frame => frame.type === "account.routing.outcome")).toHaveLength(2);
+
+			// The agent loop seeds a grant, then is cancelled before its stream starts: the host still gets
+			// exactly one outcome for it, released by operation id, and the stream's late settle adds none.
+			const cancelResolver = await child.agent.getApiKey?.(model);
+			if (typeof cancelResolver !== "function") throw new Error("Expected a resolver");
+			const cancel = new AbortController();
+			const seededCall = beginManagedCall(cancelResolver, {
+				sessionId: "child-provider-session",
+				modelId: model.id,
+				purpose: "agent_turn",
+				signal: cancel.signal,
+			});
+			if (!seededCall) throw new Error("Expected a managed call");
+			const seeded = await cancelResolver({ lastChance: false, error: undefined, managedCall: seededCall });
+			if (typeof seeded !== "object" || !seeded.managedAdmission) throw new Error("Expected a seeded admission");
+			cancel.abort();
+			const settledFor = () =>
+				frames.filter(
+					frame => frame.type === "account.routing.outcome" && frame.operationId === seededCall.operationId,
+				);
+			expect(settledFor()).toEqual([
+				expect.objectContaining({ code: "cancelled", dispatch: "not_dispatched", startedAt: null }),
+			]);
+			seeded.managedAdmission.outcome({
+				startedAt: null,
+				finishedAt: Date.now(),
+				code: "provider_failed",
+				dispatch: "dispatched",
+				replaySafe: false,
+				refusalReason: null,
+				retryAfterMs: null,
+				quotaBlocks: [],
+				windows: [],
+			});
+			adapter.releaseOperation(seededCall.operationId);
+			expect(settledFor()).toHaveLength(1);
+
+			// Other providers keep their ordinary credentials; only Claude is host-owned.
+			expect(await resolveApiKeyOnce(modelRegistry.resolver(otherModel, "child-provider-session"))).toBe(
+				"openai-key",
+			);
+
+			// A caller-supplied resolver or an account pool would bypass admission and is refused.
+			await expect(
+				createAgentSession({
+					...common,
+					sessionManager: SessionManager.inMemory(tempDir.path()),
+					getApiKey: async () => "override",
+				}),
+			).rejects.toThrow("host-managed account routing");
+			await expect(
+				createAgentSession({
+					...common,
+					sessionManager: SessionManager.inMemory(tempDir.path()),
+					oauthAccountPools: { anthropic: ["account-a"] },
+				}),
+			).rejects.toThrow("host-managed account routing");
+
+			// Disposing a session ends its pending admission instead of leaving a continuation behind.
+			const pendingResolver = await child.agent.getApiKey?.(model);
+			if (typeof pendingResolver !== "function") throw new Error("Expected a resolver");
+			adapter.attachSink(frame => frames.push(frame as never));
+			const pendingCall = beginManagedCall(pendingResolver, {
+				sessionId: child.agent.sessionId,
+				modelId: model.id,
+				purpose: "agent_turn",
+			});
+			const pending = pendingResolver({
+				lastChance: false,
+				error: undefined,
+				managedCall: pendingCall,
+			}) as Promise<unknown>;
+			const pendingOutcome = pending.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await Bun.sleep(5);
+			child.beginDispose();
+			expect(await pendingOutcome).toBeInstanceOf(ManagedDispatchRefusedError);
+			expect(frames.some(frame => frame.type === "account.routing.cancel")).toBe(true);
+		} finally {
+			for (const session of sessions.reverse()) await session.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
+
+	it("a metadata-only launch forbids every provider's dispatch through the registry", async () => {
+		const tempDir = TempDir.createSync("@pi-managed-routing-metadata-");
+		const authStorage = managedAuthStorage();
+		try {
+			const otherModel = getBundledModel("openai", "gpt-5-mini");
+			if (!otherModel) throw new Error("Expected bundled test model");
+			authStorage.keys.setRuntime("openai", "openai-key");
+			const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+			modelRegistry.useManagedRouting(new ManagedAccountRoutingAdapter("metadata"));
+			const resolved = await resolveApiKeyOnce(modelRegistry.resolver(otherModel, "session")).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(resolved).toMatchObject({ code: "unsupported_runtime" });
+		} finally {
 			authStorage.close();
 			tempDir.removeSync();
 		}

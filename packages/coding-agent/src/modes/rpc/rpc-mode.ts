@@ -67,6 +67,7 @@ import {
 } from "../persistence-failure";
 import { initializeExtensions } from "../runtime-init";
 import { cfgSpellingAutocomplete } from "../settings";
+import { dispatchAccountRoutingFrame, type ManagedAccountRoutingAdapter } from "./account-routing";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
@@ -371,6 +372,8 @@ export interface RpcInputFrameDeps {
 	onHostToolResult: (frame: RpcHostToolResult) => void;
 	onHostToolUpdate: (frame: RpcHostToolUpdate) => void;
 	onHostUriResult: (frame: RpcHostUriResult) => void;
+	/** Host-owned account routing; absent on an independent launch, which refuses `account.routing.*` commands. */
+	accountRouting?: ManagedAccountRoutingAdapter;
 }
 
 /**
@@ -386,6 +389,10 @@ function isRpcExtensionUIResponse(value: unknown): value is RpcExtensionUIRespon
 
 /** Dispatch side-channel frames that must overtake the serialized command queue. */
 export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps): boolean {
+	// Admit responses, resume wake hints and the routing commands overtake the serial queue: a
+	// quota-paused prompt or compaction must never block its own wake-up.
+	if (dispatchAccountRoutingFrame(parsed, deps.accountRouting, deps.output, deps.trackBackgroundTask)) return true;
+
 	if (isRpcExtensionUIResponse(parsed)) {
 		const pending = deps.pendingExtensionRequests.get(parsed.id);
 		if (pending) pending.resolve(parsed);
@@ -1333,6 +1340,8 @@ export interface RpcModeOptions {
 	input?: ReadableStream<Uint8Array>;
 	/** Builds `live_start` sessions; defaults to the real {@link LiveSessionController}. */
 	createLiveSession?: RpcLiveSessionFactory;
+	/** Host-owned account routing for a process launched with the owned-runtime marker. */
+	accountRouting?: ManagedAccountRoutingAdapter;
 }
 
 /**
@@ -1340,7 +1349,14 @@ export interface RpcModeOptions {
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
 export async function runRpcMode(session: AgentSession, options: RpcModeOptions = {}): Promise<never> {
-	const { setToolUIContext, headless = false, subagentEventBus, input = claimRpcInput(), createLiveSession } = options;
+	const {
+		setToolUIContext,
+		headless = false,
+		subagentEventBus,
+		input = claimRpcInput(),
+		createLiveSession,
+		accountRouting,
+	} = options;
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
 	// process.stdout with no newline, which the reader merges with the next JSON line and
@@ -1365,6 +1381,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			supportedProtocolVersions: [1, 2],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
+			// Advertised only once every native caller honors managed routing; absent in production until then.
+			...(accountRouting?.readyCapability()
+				? { capabilities: { accountRouting: accountRouting.readyCapability() } }
+				: {}),
 		}),
 	);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
@@ -1373,6 +1393,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			frameEncoder.setProtocolVersion(2);
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
+	accountRouting?.attachSink(frame => output(frame));
 
 	const success = <T extends RpcCommand["type"]>(
 		id: string | undefined,
@@ -1691,6 +1712,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 * rejection with no latched store failure still surfaces to the caller.
 	 */
 	const disposeAndExit = async (): Promise<never> => {
+		accountRouting?.dispose();
 		try {
 			// The process ends regardless; report an unsaved side answer instead of skipping dispose.
 			await btw.close().catch(btwError => {
@@ -2062,7 +2084,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					contextUsage: session.getContextUsage(),
 					goal: session.getGoalModeState() ?? null,
 				};
-				return success(id, "get_state", state);
+				const accountRoutingState = accountRouting?.stateProjection();
+				return success(
+					id,
+					"get_state",
+					accountRoutingState ? { ...state, accountRouting: accountRoutingState } : state,
+				);
 			}
 
 			case "set_fast_mode": {
@@ -2659,6 +2686,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		onHostToolResult: frame => hostToolBridge.handleResult(frame),
 		onHostToolUpdate: frame => hostToolBridge.handleUpdate(frame),
 		onHostUriResult: frame => hostUriBridge.handleResult(frame),
+		accountRouting,
 	};
 
 	const inputDispatcher = new RpcInputDispatcher({
@@ -2684,6 +2712,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	pendingExtensionRequests.rejectAll("RPC client disconnected before extension UI response completed");
 	hostToolBridge.close("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
+	// Host gone: pending admissions and quota waits fail closed so queued commands can settle.
+	accountRouting?.dispose();
 	await liveBridge.stop();
 	await inputDispatcher.drain();
 	await shutdownCoordinator.drain();

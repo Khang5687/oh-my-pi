@@ -351,6 +351,7 @@ import {
 	cfgTierGoogle,
 	cfgTierOpenai,
 } from "./session/settings";
+import type { ManagedAccountRoutingAdapter } from "./modes/rpc/account-routing";
 import { cfgInterruptMode } from "./modes/settings";
 import { cfgFollowUpMode } from "./modes/settings";
 import { cfgSteeringMode } from "./modes/settings";
@@ -554,6 +555,13 @@ export interface CreateAgentSessionOptions {
 	 * provider routing.
 	 */
 	getApiKey?: AgentOptions["getApiKey"];
+	/**
+	 * Host-owned Claude account routing for an explicitly owned launch (the RPC runtime passes the
+	 * adapter it created from the launch marker; an embedding SDK caller passes its own). Attached to the
+	 * model registry, so every resolver the registry mints, children included, asks the host. It never
+	 * reads the process environment, and it cannot be combined with a custom {@link getApiKey}.
+	 */
+	managedAccountRouting?: ManagedAccountRoutingAdapter;
 	/**
 	 * Session whose stored credential affinities are copied into this session
 	 * before any child credential operation: explicit pins always, automatic
@@ -1752,6 +1760,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		throw new Error(
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
 		);
+	}
+	// Host-owned routing is attached to the shared registry, so children inherit it in memory and every
+	// resolver it mints consults the host. A caller-supplied resolver would bypass admission: reject it.
+	if (options.managedAccountRouting) modelRegistry.useManagedRouting(options.managedAccountRouting);
+	const managedRouting = modelRegistry.managedRouting;
+	if (managedRouting && options.getApiKey) {
+		throw new Error("A custom getApiKey cannot be combined with host-managed account routing");
+	}
+	// Account pools rebuild the registry's resolver around the legacy cascade, which would bypass admission.
+	if (managedRouting && options.oauthAccountPools) {
+		throw new Error("OAuth account pools cannot be combined with host-managed account routing");
 	}
 	// Subscribe before any getApiKey() call so startup model probes can't fire a
 	// credential_disabled event past us. An embedder's constructor handler makes the
@@ -4295,8 +4314,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// request through the same primary wrapper just before the entry would
 		// expire, so idle gaps do not force a full-prefix cache re-write.
 		// Spawned/one-shot sessions opt out via `cacheWarming: false`.
+		// Under host-owned routing a warm-up would be an unadmitted proactive request: never created.
 		const cacheWarmer: CacheWarmer | undefined =
-			options.cacheWarming === false
+			options.cacheWarming === false || managedRouting
 				? undefined
 				: new CacheWarmer({
 						stream: (model, context, streamOptions) => primaryStreamFn(model, context, streamOptions),
@@ -5229,9 +5249,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// tools per run. The subscription lives for the session's lifetime; the
 		// reference is intentionally discarded (the listener retains it).
 		if (!restrictToolNames) {
-			if (cfgAutolearnEnabled.get(settings) && taskDepth === 0) {
+			if (managedRouting?.launch === "metadata") {
+				// Discovery-only launch: no memory backend, so no startup model work at all.
+			} else if (cfgAutolearnEnabled.get(settings) && taskDepth === 0 && !managedRouting) {
 				await logger.time("startMemoryStartupTask", startMemoryBackend);
 			} else {
+				// Managed: never awaited. Its model work waits for `account.routing.configure`, and
+				// session construction must return so the RPC loop can read that command.
 				void logger.time("startMemoryStartupTask", startMemoryBackend);
 			}
 			if (taskDepth === 0) {

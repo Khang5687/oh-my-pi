@@ -24,6 +24,9 @@ import type { RpcMessagesPage } from "./rpc-messages";
 import type { GoalModeState } from "../../goals/state";
 import type { RpcGoalOp, RpcGoalResult } from "./rpc-goal";
 import type { BtwHistoryRecord } from "../../session/btw-history";
+import type { ManagedDispatchStatus, ManagedOutcomeCode, RoutingRefusalCode } from "@oh-my-pi/pi-ai/auth/types";
+import type { RoutingQuotaBlock, RoutingRank } from "@oh-my-pi/pi-ai/auth/rank";
+import type { IncludedBillingState, RoutingWindow } from "@oh-my-pi/pi-ai/usage";
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -882,6 +885,263 @@ export type RpcExtensionUIResponse =
 			id: string;
 			answers: Array<{ id: string; selectedOptions: string[]; customInput?: string }>;
 	  };
+
+// ============================================================================
+// Host-owned Claude account routing (`account.routing.*`)
+// ============================================================================
+//
+// Kept apart from `RpcCommand`/`RpcResponse`: these frames exist only on a process the host launched
+// with `OMP_HOST_ACCOUNT_ROUTING`, are dispatched on the control path (they overtake the serial command
+// queue), and are not part of the generated client wire. Metadata only: no credential, token, store
+// path or exception text ever appears in them.
+
+/** Canonical purposes a model call can be attributed to. */
+export type RpcRoutingPurpose =
+	| "main"
+	| "subagent"
+	| "advisor"
+	| "title"
+	| "compaction"
+	| "memory"
+	| "vision"
+	| "repair"
+	| "eval"
+	| "judgment"
+	| "other_auxiliary";
+
+export interface RpcAccountRef {
+	storeNamespace: string;
+	nativeRowId: number;
+}
+
+/** Metadata-only projection of one account; a cache-only read, never a fetch. */
+export interface RpcRoutingAccount {
+	ref: RpcAccountRef;
+	display: {
+		email: string | null;
+		accountId: string | null;
+		organizationId: string | null;
+		organizationName: string | null;
+	};
+	credentialAvailable: boolean;
+	quotaIdentity: { accountUuid: string; organizationUuid: string } | null;
+	billing: IncludedBillingState;
+	subscriptionTier: {
+		kind: "pro" | "max5" | "max20" | "other" | "unknown";
+		observedAt: number | null;
+		source: string | null;
+	};
+	windows: RoutingWindow[];
+	quotaBlocks: RoutingQuotaBlock[];
+	rank: RoutingRank;
+}
+
+export interface RpcRoutingCatalog {
+	provider: "anthropic";
+	runtimeInstanceId: string;
+	storeNamespace: string;
+	/** Runtime-scoped; only comparable with revisions from the same `runtimeInstanceId`. */
+	catalogRevision: number;
+	nativeCredentialGeneration: number;
+	observedAt: number;
+	authoritativeObservedAt: number | null;
+	authoritativeComplete: boolean;
+	accounts: RpcRoutingAccount[];
+}
+
+export type RpcAccountRoutingCommand =
+	| {
+			id?: string;
+			type: "account.routing.configure";
+			version: 1;
+			hostEpoch: string;
+			runtimeInstanceId: string;
+			scope: "host-owned";
+			provider: "anthropic";
+			includedOnly: true;
+	  }
+	| {
+			id?: string;
+			type: "account.routing.refresh";
+			hostEpoch: string;
+			runtimeInstanceId: string;
+			accountRef: RpcAccountRef;
+			modelId: string;
+	  }
+	| {
+			id?: string;
+			type: "account.routing.rank";
+			hostEpoch: string;
+			runtimeInstanceId: string;
+			modelId: string;
+			catalogRevision: number;
+			candidateRefs: RpcAccountRef[];
+			nowMs: number;
+	  };
+
+export interface RpcAccountRoutingConfigureData {
+	version: 1;
+	configured: true;
+	completeCoverage: boolean;
+	modelDispatch: "allowed" | "forbidden";
+	purposes: RpcRoutingPurpose[];
+	accessibleNamespaces: string[];
+	catalogs: RpcRoutingCatalog[];
+}
+
+export interface RpcAccountRoutingRankData {
+	method: "claude-native-window-pressure-v1";
+	version: 1;
+	catalogRevision: number;
+	anchorRef: RpcAccountRef | null;
+	bestCloseRefs: RpcAccountRef[];
+}
+
+/** Correlated command response. Failures carry an allowlisted `code` and a fixed, non-leaking message. */
+export type RpcAccountRoutingResponse =
+	| {
+			id?: string;
+			type: "response";
+			command: RpcAccountRoutingCommand["type"];
+			success: true;
+			data: RpcAccountRoutingConfigureData | { catalog: RpcRoutingCatalog } | RpcAccountRoutingRankData;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: string;
+			success: false;
+			error: string;
+			code: string;
+	  };
+
+export type RpcAccountRoutingDecision =
+	| {
+			kind: "admit";
+			admissionId: string;
+			accountRef: RpcAccountRef;
+			selectionGeneration: number;
+			policyRevision: number;
+	  }
+	| { kind: "wait"; waitId: string; reason: string; reconsiderAt?: number }
+	| { kind: "refuse"; reason: string };
+
+/** Native to host: ask which account serves this attempt. Carries no prompt, tool payload or credential. */
+export interface RpcAccountRoutingAdmitRequest {
+	type: "account.routing.admit.request";
+	id: string;
+	hostEpoch: string;
+	runtimeInstanceId: string;
+	operationId: string;
+	attemptId: string;
+	sessionId: string;
+	purpose: RpcRoutingPurpose;
+	provider: "anthropic";
+	modelId: string;
+	requestGeneration: number;
+	/** Retires the wait this re-admission follows. */
+	previousWaitId?: string;
+	catalog: RpcRoutingCatalog;
+}
+
+/** Host to native, on the control path. */
+export interface RpcAccountRoutingAdmitResponse {
+	type: "account.routing.admit.response";
+	id: string;
+	hostEpoch: string;
+	runtimeInstanceId: string;
+	decision: RpcAccountRoutingDecision;
+}
+
+/** Host to native wake hint for a retained wait; never a credential grant. */
+export interface RpcAccountRoutingResume {
+	type: "account.routing.resume";
+	waitId: string;
+	hostEpoch?: string;
+	runtimeInstanceId?: string;
+}
+
+export interface RpcAccountRoutingStarted {
+	type: "account.routing.started";
+	hostEpoch: string;
+	runtimeInstanceId: string;
+	admissionId: string;
+	operationId: string;
+	attemptId: string;
+	sessionId: string;
+	modelId: string;
+	accountRef: RpcAccountRef;
+	selectionGeneration: number;
+	startedAt: number;
+}
+
+export interface RpcAccountRoutingOutcome extends Omit<RpcAccountRoutingStarted, "type" | "startedAt"> {
+	type: "account.routing.outcome";
+	startedAt: number | null;
+	finishedAt: number;
+	code: ManagedOutcomeCode;
+	dispatch: ManagedDispatchStatus;
+	replaySafe: boolean;
+	refusalReason: RoutingRefusalCode | null;
+	retryAfterMs: number | null;
+	quotaBlocks: RoutingQuotaBlock[];
+	windows: RoutingWindow[];
+}
+
+export interface RpcAccountRoutingPaused {
+	type: "account.routing.paused";
+	hostEpoch: string;
+	runtimeInstanceId: string;
+	waitId: string;
+	operationId: string;
+	attemptId: string;
+	sessionId: string;
+	modelId: string;
+	reason: string;
+}
+
+export interface RpcAccountRoutingResumed {
+	type: "account.routing.resumed";
+	hostEpoch: string;
+	runtimeInstanceId: string;
+	waitId: string;
+	operationId: string;
+	requestGeneration: number;
+	sessionId: string;
+	modelId: string;
+}
+
+/** Native to host: withdraw a pending admission or wait. Idempotent. */
+export interface RpcAccountRoutingCancel {
+	type: "account.routing.cancel";
+	/** Correlation id of the original admit request. */
+	id: string;
+	hostEpoch: string;
+	runtimeInstanceId: string;
+	waitId?: string;
+	admissionId?: string;
+	operationId: string;
+	attemptId: string;
+	sessionId: string;
+}
+
+export type RpcAccountRoutingEvent =
+	| RpcAccountRoutingAdmitRequest
+	| RpcAccountRoutingStarted
+	| RpcAccountRoutingOutcome
+	| RpcAccountRoutingPaused
+	| RpcAccountRoutingResumed
+	| RpcAccountRoutingCancel;
+
+/** `get_state.accountRouting`: present only on a configured host-owned process. */
+export interface RpcAccountRoutingState {
+	version: 1;
+	hostEpoch: string;
+	runtimeInstanceId: string;
+	pendingAdmissions: string[];
+	pausedWaits: string[];
+	activeAdmissions: string[];
+}
 
 // ============================================================================
 // Helper type for extracting command types
