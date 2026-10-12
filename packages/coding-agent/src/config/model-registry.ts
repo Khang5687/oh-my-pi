@@ -53,7 +53,14 @@ import { resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
 import { redactUrlForLog } from "../mcp/json-rpc";
 import type { AuthStorage } from "../session/auth-storage";
-import { type ApiKeyResolverModel, type ApiKeyResolverOptions, createApiKeyResolver } from "./api-key-resolver";
+import type { ManagedAccountRoutingAdapter } from "../modes/rpc/account-routing";
+import {
+	type ApiKeyResolverModel,
+	type ApiKeyResolverOptions,
+	createApiKeyResolver,
+	createForbiddenApiKeyResolver,
+	createManagedApiKeyResolver,
+} from "./api-key-resolver";
 import type { ConfigError, ConfigFile } from "./config-file";
 import {
 	buildCustomModelOverlay,
@@ -298,6 +305,7 @@ export type ResolvedRequestAuth =
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
  */
 export class ModelRegistry {
+	#managedRouting: ManagedAccountRoutingAdapter | undefined;
 	#models: Model<Api>[] = [];
 	#unprojectedModels: Model<Api>[] = [];
 	/**
@@ -3332,14 +3340,31 @@ export class ModelRegistry {
 	resolver(model: ApiKeyResolverModel, sessionId?: string): ApiKeyResolver;
 	resolver(target: string | ApiKeyResolverModel, optionsOrSessionId?: ApiKeyResolverOptions | string): ApiKeyResolver {
 		const options = typeof optionsOrSessionId === "string" ? { sessionId: optionsOrSessionId } : optionsOrSessionId;
-		if (typeof target === "string") {
-			return createApiKeyResolver(this, target, options);
+		const provider = typeof target === "string" ? target : target.provider;
+		const resolved: ApiKeyResolverOptions =
+			typeof target === "string" ? (options ?? {}) : { ...options, baseUrl: target.baseUrl, modelId: target.id };
+		const managed = this.#managedRouting;
+		// Host-owned routing covers every resolver this registry mints, whatever session id it carries.
+		if (managed?.launch === "metadata") return createForbiddenApiKeyResolver(managed);
+		if (managed && provider === "anthropic") return createManagedApiKeyResolver(this, managed, resolved);
+		return createApiKeyResolver(this, provider, resolved);
+	}
+
+	/**
+	 * Host-owned account routing adapter, set once by an explicitly owned launch. Children created from
+	 * this registry inherit it, so every `resolver(model, anySessionId)` consults the host.
+	 */
+	get managedRouting(): ManagedAccountRoutingAdapter | undefined {
+		return this.#managedRouting;
+	}
+
+	/** Attach host-owned routing. Never cleared: a disposed adapter refuses instead of reverting to independent auth. */
+	useManagedRouting(adapter: ManagedAccountRoutingAdapter): void {
+		if (this.#managedRouting && this.#managedRouting !== adapter) {
+			throw new Error("Model registry already uses a different managed account routing adapter");
 		}
-		return createApiKeyResolver(this, target.provider, {
-			...options,
-			baseUrl: target.baseUrl,
-			modelId: target.id,
-		});
+		adapter.bindAuthStorage(this.authStorage);
+		this.#managedRouting = adapter;
 	}
 
 	async #peekApiKeyForProvider(provider: string): Promise<string | undefined> {

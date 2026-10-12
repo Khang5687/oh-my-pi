@@ -5486,6 +5486,8 @@ export class AgentSession implements SettingsScope {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		// Waits and unreported grants of this session end with it (host-owned account routing only).
+		this.#modelRegistry.managedRouting?.releaseSession(this.sessionId);
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#modelDiscoveryAbortController.abort();
 		this.#queuedMessageDrainBlocked = false;

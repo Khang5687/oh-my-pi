@@ -78,6 +78,7 @@ import type { MCPManager } from "./mcp";
 import type { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import type { RpcModeOptions } from "./modes/rpc/rpc-mode";
+import { consumeHostAccountRoutingMarker, ManagedAccountRoutingAdapter } from "./modes/rpc/account-routing";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
 import { CURRENT_SETUP_VERSION } from "@oh-my-pi/pi-tui/setup/setup-version";
 import type * as SetupWizardModule from "./modes/setup";
@@ -1783,6 +1784,13 @@ export async function runRootCommand(
 		const mode = parsedArgs.mode || "text";
 		// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
 		const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
+		// The host's owned-launch marker is read once and removed before any child tool process can
+		// inherit it; only an RPC process adopts it, as an adapter that waits for `account.routing.configure`.
+		const hostAccountRoutingLaunch = consumeHostAccountRoutingMarker();
+		const hostAccountRouting =
+			hostAccountRoutingLaunch && (mode === "rpc" || mode === "rpc-ui")
+				? new ManagedAccountRoutingAdapter(hostAccountRoutingLaunch)
+				: undefined;
 
 		// Kick off plugin-root preload in parallel with the remaining startup work.
 		// Awaited later (before extension/skill discovery in createAgentSession needs it).
@@ -2266,6 +2274,7 @@ export async function runRootCommand(
 
 		const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 		const createSession = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
+			if (hostAccountRouting) options = { ...options, managedAccountRouting: hostAccountRouting };
 			const result = await logger.time("createAgentSession", createAgentSessionImpl, options);
 			// Kick off background model discovery only after createAgentSession finishes its parallel
 			// discovery arms; running these concurrently contends for the event loop and stretches
@@ -2574,6 +2583,7 @@ export async function runRootCommand(
 					headless: parsedArgs.noUi === true,
 					subagentEventBus,
 					input: rpcInput,
+					accountRouting: hostAccountRouting,
 				});
 			} else if (isInteractive) {
 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);

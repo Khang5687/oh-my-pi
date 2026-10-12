@@ -10,9 +10,10 @@ import {
 	parseSessionEntries,
 	type SessionMessageEntry,
 } from "@oh-my-pi/pi-coding-agent";
-import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
+import { RpcClient, RpcCommandError } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
+import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { BashExecutionMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { getAgentDbPath, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { rejectionOf } from "./helpers/rejection";
 import { e2eApiKey } from "./utilities";
 
@@ -353,5 +354,97 @@ describe("RPC fast mode with unsupported Fireworks model and priority tier", () 
 		const state = await client.getState();
 		expect(state.fastModeEnabled).toBe(false);
 		expect(state.fastModeActive).toBe(true);
+	}, 30000);
+});
+
+/**
+ * Real owned-launch processes. They need no provider key: the stores hold synthetic credentials in a
+ * disposable HOME, and no model call is made.
+ */
+describe("RPC host-owned account routing launch", () => {
+	let home: string;
+
+	beforeEach(() => {
+		home = fs.mkdtempSync(path.join(os.tmpdir(), "omp-rpc-routing-"));
+	});
+
+	afterEach(() => {
+		removeSyncWithRetries(home);
+	});
+
+	async function launch(marker: string | undefined): Promise<RpcClient> {
+		const agentDir = path.join(home, "agent");
+		const dbPath = getAgentDbPath(agentDir);
+		fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+		const store = await SqliteAuthCredentialStore.open(dbPath);
+		await new AuthStorage(store).credentials.set(
+			"anthropic",
+			["a", "b"].map(suffix => ({
+				type: "oauth" as const,
+				access: `sk-ant-oat01-synthetic-${suffix}`,
+				refresh: `synthetic-refresh-${suffix}`,
+				expires: Date.now() + 3_600_000,
+				accountId: `acc-${suffix}`,
+				email: `${suffix}@example.invalid`,
+			})),
+		);
+		store.close();
+		const client = new RpcClient({
+			command: ["bun", path.join(import.meta.dir, "..", "src", "cli.ts")],
+			cwd: home,
+			env: {
+				HOME: home,
+				PI_CODING_AGENT_DIR: agentDir,
+				PI_NOTIFICATIONS: "off",
+				...(marker ? { OMP_HOST_ACCOUNT_ROUTING: marker } : {}),
+			},
+			args: ["--no-session"],
+		});
+		await client.start();
+		return client;
+	}
+
+	const configureParams = { hostEpoch: "epoch-1", runtimeInstanceId: "rt-1" };
+
+	test("an unmarked process refuses configure and reports no routing state", async () => {
+		const client = await launch(undefined);
+		try {
+			const refusal = await rejectionOf(client.accountRoutingConfigure(configureParams));
+			expect(refusal).toBeInstanceOf(RpcCommandError);
+			expect(refusal).toMatchObject({ code: "unsupported_runtime" });
+			expect(await client.getState()).not.toHaveProperty("accountRouting");
+		} finally {
+			await client.stop();
+		}
+	}, 30000);
+
+	test("a marked process keeps the production coverage gate closed", async () => {
+		const client = await launch("1");
+		try {
+			const refusal = await rejectionOf(client.accountRoutingConfigure(configureParams));
+			expect(refusal).toMatchObject({ code: "unsupported_runtime" });
+			expect(await client.getState()).not.toHaveProperty("accountRouting");
+		} finally {
+			await client.stop();
+		}
+	}, 30000);
+
+	test("a metadata launch lists fixture accounts, forbids dispatch, and hides the marker from tool processes", async () => {
+		const client = await launch("metadata");
+		try {
+			const configured = await client.accountRoutingConfigure(configureParams);
+			expect(configured).toMatchObject({ configured: true, modelDispatch: "forbidden", completeCoverage: false });
+			expect(configured.catalogs[0]?.accounts.map(account => account.display.email)).toEqual([
+				"a@example.invalid",
+				"b@example.invalid",
+			]);
+			expect(JSON.stringify(configured)).not.toContain("sk-ant-oat01");
+			expect(await client.getState()).toMatchObject({ accountRouting: { hostEpoch: "epoch-1", pausedWaits: [] } });
+			// The marker was consumed from the real process environment: a tool-spawned process stays unmarked.
+			const shell = await client.bash('printf "marker=[%s]" "$OMP_HOST_ACCOUNT_ROUTING"');
+			expect(shell.output).toBe("marker=[]");
+		} finally {
+			await client.stop();
+		}
 	}, 30000);
 });

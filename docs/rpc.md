@@ -95,6 +95,7 @@ Clients MUST continue reading stdout after closing stdin. Normal EOF and extensi
 13. Builtin slash-command side channels (`command_output`, `session_info_update`, `config_update`)
 14. Transport overflow notifications (`rpc_frame_error`), when an event cannot fit within the transport limits
 15. Live voice frames (`live_phase`, `live_levels`, `live_transcript`, `live_end`); see [Live Voice Sub-Protocol](#live-voice-sub-protocol)
+16. Host-owned account routing frames (`account.routing.admit.request`, `.started`, `.outcome`, `.paused`, `.resumed`, `.cancel`), only on a process launched for a managed host; see [Host-Owned Account Routing](#host-owned-account-routing)
 
 Protocol v2 may wrap oversized logical frames from these categories in `rpc_chunk` frames.
 
@@ -104,6 +105,7 @@ Protocol v2 may wrap oversized logical frames from these categories in `rpc_chun
 2. `RpcExtensionUIResponse` (`{ type: "extension_ui_response", ... }`)
 3. Host tool updates/results (`host_tool_update`, `host_tool_result`)
 4. Host URI results (`host_uri_result`)
+5. Host-owned account routing frames (`account.routing.admit.response`, `account.routing.resume`) and commands (`account.routing.configure`, `.refresh`, `.rank`); these overtake the serial command queue
 
 ## Request/Response Correlation
 
@@ -1480,6 +1482,42 @@ a message or fall back to `content` for textual error surfacing:
   value as an empty string. `contentType` defaults to `text/plain` and its
   declared values are `"text/plain"`, `"text/markdown"`, or `"application/json"`.
   A result-level `immutable` overrides the registered scheme's value for that read.
+
+## Host-Owned Account Routing
+
+A managed host (a process that owns which Claude account serves each request) launches OMP with `OMP_HOST_ACCOUNT_ROUTING=1`, or `=metadata` for discovery only. Any other launch is an independent OMP: it refuses every `account.routing.*` command with `code: "unsupported_runtime"`, and nothing below applies. Managed routing never writes global settings or account policy.
+
+The marker is read once at RPC startup and removed from the process environment, including the native environment that shell tools inherit, so a terminal or `omp` started by a tool is not managed. The marker moves the process into **pending-configure**: a Claude model call, including startup memory work, is held without sending any frame until `account.routing.configure` arrives. Session construction does not wait for it.
+
+`account.routing.configure`, `.refresh` and `.rank` are ordinary correlated commands (`id`, `type: "response"`), but they and the two inbound frames below are dispatched ahead of the serial command queue, so a prompt or compaction waiting on a quota decision cannot block its own wake-up. Failures carry `success: false` and an allowlisted `code` (`unsupported_runtime`, `invalid_request`, `host_unavailable`, `metadata_pending`, `source_changed`, `no_account`, and the other admission refusal codes); the message never contains exception text.
+
+| Command | Payload | Response `data` |
+| --- | --- | --- |
+| `account.routing.configure` | `{ version: 1, hostEpoch, runtimeInstanceId, scope: "host-owned", provider: "anthropic", includedOnly: true }` | `{ version, configured, completeCoverage, modelDispatch, purposes, accessibleNamespaces, catalogs }` |
+| `account.routing.refresh` | `{ hostEpoch, runtimeInstanceId, accountRef, modelId }` | `{ catalog }`: reads one row's billing and usage windows, no sibling, no model call |
+| `account.routing.rank` | `{ hostEpoch, runtimeInstanceId, modelId, catalogRevision, candidateRefs, nowMs }` | `{ method, version, catalogRevision, anchorRef, bestCloseRefs }`: cached evidence only, no I/O |
+
+`accountRef` is `{ storeNamespace, nativeRowId }`: an opaque credential-store UUID and the durable row id. Catalogs and frames carry account display fields, billing state and usage windows, never a token, refresh token or store path. `catalogRevision` is scoped to its `runtimeInstanceId`; `rank` answers `metadata_pending` when the evidence moved since the revision the host ranked from.
+
+Configure is idempotent for an identical repeat. The same `hostEpoch` with another `runtimeInstanceId` is refused. A new `hostEpoch` cancels pending admissions and waits; requests already dispatched finish on their old grant and report under the old epoch. In a `metadata` launch configure succeeds with `modelDispatch: "forbidden"` and every model call is refused.
+
+Production OMP answers configure with `unsupported_runtime`, and `ready` carries no `capabilities.accountRouting`, until every native model-calling path honors managed routing. `omp account-routing-capabilities` reports the same coverage statically.
+
+### Admission
+
+For each provider HTTP attempt OMP writes `account.routing.admit.request` (`id`, `hostEpoch`, `runtimeInstanceId`, `operationId`, `attemptId`, `sessionId`, `purpose`, `provider`, `modelId`, `requestGeneration`, optional `previousWaitId`, and a cache-only `catalog`) and waits for `account.routing.admit.response` with the same `id` and a `decision`:
+
+- `{ kind: "admit", admissionId, accountRef, selectionGeneration, policyRevision }` serves exactly this attempt from that row.
+- `{ kind: "wait", waitId, reason, reconsiderAt? }` pauses the call. OMP emits `account.routing.paused`, keeps the call (prepared context and completed tools included), and does nothing until the host sends `account.routing.resume` with that `waitId`. Resume is a wake hint, not a grant: OMP emits `account.routing.resumed` and asks again with a new `id` and `previousWaitId`. OMP does not poll; the host schedules its own wake-up.
+- `{ kind: "refuse", reason }` fails the attempt closed. There is no fallback to an unmanaged credential, a sibling account, an API key or the environment.
+
+For every admission OMP emits `account.routing.started` immediately before the provider request and exactly one `account.routing.outcome` (`code`, `dispatch`, `replaySafe`, `retryAfterMs`, `quotaBlocks`, `windows`). A grant that never reaches a request (the call is aborted before its stream starts, the session ends, the host disconnects) still gets one outcome with `dispatch: "not_dispatched"`. Duplicate, late, wrong-epoch and wrong-instance responses and resumes are ignored.
+
+Aborting a call, ending its session, replacing the epoch, or closing stdin makes OMP emit `account.routing.cancel` (`id` of the original request, plus `waitId` for a wait) and fail the waiting call. After EOF a managed process refuses new model calls instead of reverting to unmanaged auth.
+
+`get_state` adds `accountRouting` (`{ version, hostEpoch, runtimeInstanceId, pendingAdmissions, pausedWaits, activeAdmissions }`) on a configured managed process and omits it otherwise. A call waiting on the host is running work: `isStreaming` stays `true`.
+
+Limits: the host owns the decision to leave an account; OMP does not rebalance, rotate or mark durable quota blocks in this mode. Included-only admission rests on a fresh `usage credits disabled` observation (300000 ms) and the assumption that the setting stays off until the request completes; there is no per-request provider flag. Subscription tier is reported `unknown`.
 
 ## Error Model and Recoverability
 

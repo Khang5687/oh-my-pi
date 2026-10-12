@@ -26,6 +26,13 @@ import {
 } from "./rpc-messages";
 import type {
 	RpcAbortAndRestoreQueueResult,
+	RpcAccountRoutingAdmitResponse,
+	RpcAccountRoutingCommand,
+	RpcAccountRoutingConfigureData,
+	RpcAccountRoutingEvent,
+	RpcAccountRoutingRankData,
+	RpcAccountRoutingResume,
+	RpcRoutingCatalog,
 	RpcAvailableCommandsUpdateFrame,
 	RpcBtwDeltaFrame,
 	RpcBtwRecordFrame,
@@ -58,7 +65,7 @@ import type {
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 
 /** RpcCommand without the id field (for internal send) */
-type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
+type RpcCommandBody = DistributiveOmit<RpcCommand | RpcAccountRoutingCommand, "id">;
 
 /** Process transport consumed by {@link RpcClient}. */
 export interface RpcAgentProcess {
@@ -114,6 +121,7 @@ export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
 export type RpcPromptResultListener = (result: RpcPromptResultFrame) => void;
 export type RpcSessionSettledListener = () => void;
+export type RpcAccountRoutingListener = (frame: RpcAccountRoutingEvent) => void;
 export type RpcLiveListener = (frame: RpcLiveFrame) => void;
 
 export interface RpcClientToolContext<TDetails = unknown> {
@@ -262,6 +270,19 @@ function isRpcBtwDeltaFrame(value: unknown): value is RpcBtwDeltaFrame {
 	);
 }
 
+const ACCOUNT_ROUTING_EVENT_TYPES: ReadonlySet<string> = new Set([
+	"account.routing.admit.request",
+	"account.routing.started",
+	"account.routing.outcome",
+	"account.routing.paused",
+	"account.routing.resumed",
+	"account.routing.cancel",
+]);
+
+function isRpcAccountRoutingEvent(value: unknown): value is RpcAccountRoutingEvent {
+	return isRecord(value) && typeof value.type === "string" && ACCOUNT_ROUTING_EVENT_TYPES.has(value.type);
+}
+
 function isRpcBtwRecordFrame(value: unknown): value is RpcBtwRecordFrame {
 	return isRecord(value) && value.type === "btw_record" && isRecord(value.record);
 }
@@ -331,6 +352,7 @@ export class RpcClient {
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
 	#btwDeltaListeners = new Set<(frame: RpcBtwDeltaFrame) => void>();
 	#btwRecordListeners = new Set<(record: BtwHistoryRecord) => void>();
+	#accountRoutingListeners = new Set<RpcAccountRoutingListener>();
 	#promptResultListeners = new Set<RpcPromptResultListener>();
 	#sessionSettledListeners = new Set<RpcSessionSettledListener>();
 	#liveListeners = new Set<RpcLiveListener>();
@@ -639,6 +661,15 @@ export class RpcClient {
 		return () => this.#btwDeltaListeners.delete(listener);
 	}
 
+	/**
+	 * Subscribe to `account.routing.*` frames from a host-owned process: admission requests the host must
+	 * answer with {@link sendAccountRoutingFrame}, plus started/outcome/paused/resumed/cancel events.
+	 */
+	onAccountRouting(listener: RpcAccountRoutingListener): () => void {
+		this.#accountRoutingListeners.add(listener);
+		return () => this.#accountRoutingListeners.delete(listener);
+	}
+
 	/** Subscribe to `btw_record` frames: a side question's full record on every lifecycle change. */
 	onBtwRecord(listener: (record: BtwHistoryRecord) => void): () => void {
 		this.#btwRecordListeners.add(listener);
@@ -785,6 +816,51 @@ export class RpcClient {
 	async newSession(parentSession?: string): Promise<{ cancelled: boolean }> {
 		const response = await this.#send({ type: "new_session", parentSession });
 		return this.#getData(response);
+	}
+
+	/** Configure host-owned account routing. Only a process launched with `OMP_HOST_ACCOUNT_ROUTING` accepts it. */
+	async accountRoutingConfigure(params: {
+		hostEpoch: string;
+		runtimeInstanceId: string;
+	}): Promise<RpcAccountRoutingConfigureData> {
+		const response = await this.#send({
+			type: "account.routing.configure",
+			version: 1,
+			scope: "host-owned",
+			provider: "anthropic",
+			includedOnly: true,
+			...params,
+		});
+		return this.#getData<RpcAccountRoutingConfigureData>(response);
+	}
+
+	/** Refresh one exact account's billing and window evidence; returns the updated catalog. */
+	async accountRoutingRefresh(params: {
+		hostEpoch: string;
+		runtimeInstanceId: string;
+		accountRef: { storeNamespace: string; nativeRowId: number };
+		modelId: string;
+	}): Promise<{ catalog: RpcRoutingCatalog }> {
+		const response = await this.#send({ type: "account.routing.refresh", ...params });
+		return this.#getData<{ catalog: RpcRoutingCatalog }>(response);
+	}
+
+	/** Rank a host-chosen subset of accounts from cached evidence; no I/O. */
+	async accountRoutingRank(params: {
+		hostEpoch: string;
+		runtimeInstanceId: string;
+		modelId: string;
+		catalogRevision: number;
+		candidateRefs: Array<{ storeNamespace: string; nativeRowId: number }>;
+		nowMs: number;
+	}): Promise<RpcAccountRoutingRankData> {
+		const response = await this.#send({ type: "account.routing.rank", ...params });
+		return this.#getData<RpcAccountRoutingRankData>(response);
+	}
+
+	/** Answer an admission request, or wake a paused wait. Both bypass the command queue on the server. */
+	sendAccountRoutingFrame(frame: RpcAccountRoutingAdmitResponse | RpcAccountRoutingResume): void {
+		this.#writeFrame(frame);
 	}
 
 	/**
@@ -1496,6 +1572,11 @@ export class RpcClient {
 			return;
 		}
 
+		if (isRpcAccountRoutingEvent(data)) {
+			for (const listener of this.#accountRoutingListeners) listener(data);
+			return;
+		}
+
 		if (isRpcSessionSettledFrame(data)) {
 			for (const listener of this.#sessionSettledListeners) {
 				listener();
@@ -1645,7 +1726,13 @@ export class RpcClient {
 	}
 
 	#writeFrame(
-		frame: RpcCommand | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate,
+		frame:
+			| RpcCommand
+			| RpcExtensionUIResponse
+			| RpcHostToolResult
+			| RpcHostToolUpdate
+			| RpcAccountRoutingAdmitResponse
+			| RpcAccountRoutingResume,
 		onError?: (error: Error) => void,
 	): void {
 		if (!this.#process?.stdin) {
