@@ -1038,7 +1038,7 @@ describe("host-owned account routing over JSONL", () => {
 		await host.close();
 	});
 
-	test("production keeps the coverage gate closed: configure fails and ready advertises nothing", async () => {
+	test("a runtime without complete coverage refuses configure and advertises nothing", async () => {
 		const host = await fixture({ completeCoverage: false });
 		await host.configure();
 		expect(host.responseFor("cfg")).toMatchObject({ success: false, code: "unsupported_runtime" });

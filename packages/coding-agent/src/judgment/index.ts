@@ -41,7 +41,7 @@ import {
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
-import type { ModelRegistry } from "../config/model-registry";
+import { isModelAuthAvailable, type ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, resolveRoleChain, type RoleChainCandidate } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import type { Settings } from "../config/settings";
@@ -335,14 +335,14 @@ export class ChainJudge implements Judge {
 	async #createJudge(candidate: RoleChainCandidate, signal: AbortSignal | undefined): Promise<Judge | undefined> {
 		const model = candidate.model;
 		if (model.api === "local-inference") return new TextJudge(new LocalTextBackend(model.id));
-		if (!(await this.#deps.registry.getApiKey(model, this.#deps.sessionId, { signal }))) return undefined;
-		const apiKey = this.#deps.registry.resolver(model, this.#deps.sessionId);
+		if (!(await isModelAuthAvailable(this.#deps.registry, model, this.#deps.sessionId, { signal }))) return undefined;
+		const apiKey = this.#deps.registry.resolver(model, this.#deps.sessionId, "judgment");
 		if (isJudgmentApi(model.api)) {
 			const headers = await this.#deps.registry.resolveModelHeaders(model, signal);
 			const judge = createNativeJudge(model, { apiKey, headers });
 			return nativeJudge(judge, model, this.#deps.cache, attempt => this.#report(attempt));
 		}
-		// Resolve metadata after getApiKey so the session-sticky credential is recorded first.
+		// Resolve metadata after the auth guard so the session-sticky credential is recorded first.
 		const metadata = this.#deps.metadataResolver?.(model.provider);
 		const backend = chatTextBackend(model, {
 			apiKey,

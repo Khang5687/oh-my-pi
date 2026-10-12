@@ -54,7 +54,7 @@ function expected(mode: "model" | "metadata"): string {
 		provider: "anthropic",
 		managedAccountRouting: {
 			modelDispatch: model ? "allowed" : "forbidden",
-			completeCoverage: false,
+			completeCoverage: model,
 			purposes: ["model-dispatch", "metadata", "usage-refresh"],
 			sourceIdentity: "v1",
 			exactUsageRefresh: "v1",
@@ -111,14 +111,18 @@ describe("omp account-routing-capabilities", () => {
 	}, 30_000);
 
 	it("serializer honors the coverage constant and overrides", () => {
-		expect(MANAGED_ROUTING_COMPLETE_COVERAGE).toBe(false);
+		expect(MANAGED_ROUTING_COMPLETE_COVERAGE).toBe(true);
 		const model = JSON.parse(serializeManagedRoutingCapabilities({ mode: "model", buildVersion: null }));
-		expect(model.managedAccountRouting.completeCoverage).toBe(false);
+		expect(model.managedAccountRouting.completeCoverage).toBe(true);
 		expect(model.build).toEqual({ version: null });
 		const covered = JSON.parse(
 			serializeManagedRoutingCapabilities({ mode: "model", buildVersion: "1", completeCoverage: true }),
 		);
 		expect(covered.managedAccountRouting.completeCoverage).toBe(true);
+		const uncovered = JSON.parse(
+			serializeManagedRoutingCapabilities({ mode: "model", buildVersion: "1", completeCoverage: false }),
+		);
+		expect(uncovered.managedAccountRouting.completeCoverage).toBe(false);
 		const metadata = JSON.parse(
 			serializeManagedRoutingCapabilities({ mode: "metadata", buildVersion: "1", completeCoverage: true }),
 		);

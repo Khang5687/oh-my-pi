@@ -418,12 +418,12 @@ describe("RPC host-owned account routing launch", () => {
 		}
 	}, 30000);
 
-	test("a marked process keeps the production coverage gate closed", async () => {
+	test("a marked process advertises complete coverage and configures", async () => {
 		const client = await launch("1");
 		try {
-			const refusal = await rejectionOf(client.accountRoutingConfigure(configureParams));
-			expect(refusal).toMatchObject({ code: "unsupported_runtime" });
-			expect(await client.getState()).not.toHaveProperty("accountRouting");
+			const configured = await client.accountRoutingConfigure(configureParams);
+			expect(configured).toMatchObject({ configured: true, modelDispatch: "allowed", completeCoverage: true });
+			expect(await client.getState()).toHaveProperty("accountRouting");
 		} finally {
 			await client.stop();
 		}

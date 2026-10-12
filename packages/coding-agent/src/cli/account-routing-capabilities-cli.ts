@@ -7,11 +7,11 @@
  */
 
 /**
- * Whether every provider-calling surface honors managed routing. The auxiliary
- * caller cutover flips this single constant to true; the CLI output and the
- * owned-runtime adapter both read it, so they cannot drift.
+ * Whether every provider-calling surface honors managed routing: each built-in Claude caller either
+ * dispatches through host admission or refuses by name (managed-account-routing-auxiliary.test.ts).
+ * The CLI output and the owned-runtime adapter both read this constant, so they cannot drift.
  */
-export const MANAGED_ROUTING_COMPLETE_COVERAGE = false;
+export const MANAGED_ROUTING_COMPLETE_COVERAGE = true;
 
 export type ManagedRoutingMode = "model" | "metadata";
 

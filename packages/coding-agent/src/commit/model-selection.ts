@@ -1,6 +1,7 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
 import type { ApiKeyResolverRegistry } from "../config/api-key-resolver";
+import { isModelAuthAvailable, type ModelRegistry } from "../config/model-registry";
 import {
 	getModelMatchPreferences,
 	type ModelLookupRegistry,
@@ -32,7 +33,7 @@ export interface ResolvedCommitModel {
 type CommitModelRegistry = ModelLookupRegistry &
 	ApiKeyResolverRegistry & {
 		getApiKey: (model: Model<Api>) => Promise<string | undefined>;
-	};
+	} & Partial<Pick<ModelRegistry, "isManagedClaude" | "isAuthAvailable">>;
 
 export async function resolvePrimaryModel(
 	override: string | undefined,
@@ -48,13 +49,12 @@ export async function resolvePrimaryModel(
 	if (!model) {
 		throw new Error("No model available for commit generation");
 	}
-	const apiKey = await modelRegistry.getApiKey(model);
-	if (!apiKey) {
+	if (!(await isModelAuthAvailable(modelRegistry, model))) {
 		throw new Error(`No API key available for model ${model.provider}/${model.id}`);
 	}
 	return {
 		model,
-		apiKey: modelRegistry.resolver(model),
+		apiKey: modelRegistry.resolver(model, undefined, "other_auxiliary"),
 		thinkingLevel: concreteThinkingLevel(resolved?.thinkingLevel),
 	};
 }
@@ -68,11 +68,10 @@ export async function resolveSmolModel(
 	const available = modelRegistry.getAvailable();
 	const resolvedSmol = resolveRoleSelection(["smol"], settings, available);
 	if (resolvedSmol?.model) {
-		const apiKey = await modelRegistry.getApiKey(resolvedSmol.model);
-		if (apiKey) {
+		if (await isModelAuthAvailable(modelRegistry, resolvedSmol.model)) {
 			return {
 				model: resolvedSmol.model,
-				apiKey: modelRegistry.resolver(resolvedSmol.model),
+				apiKey: modelRegistry.resolver(resolvedSmol.model, undefined, "other_auxiliary"),
 				thinkingLevel: concreteThinkingLevel(resolvedSmol.thinkingLevel),
 			};
 		}
@@ -82,11 +81,10 @@ export async function resolveSmolModel(
 	for (const pattern of MODEL_PRIO.smol) {
 		const candidate = parseModelPattern(pattern, available, matchPreferences).model;
 		if (!candidate) continue;
-		const apiKey = await modelRegistry.getApiKey(candidate);
-		if (apiKey) {
+		if (await isModelAuthAvailable(modelRegistry, candidate)) {
 			return {
 				model: candidate,
-				apiKey: modelRegistry.resolver(candidate),
+				apiKey: modelRegistry.resolver(candidate, undefined, "other_auxiliary"),
 			};
 		}
 	}

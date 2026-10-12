@@ -20,6 +20,11 @@ export interface ApiKeyResolverOptions {
 	baseUrl?: string;
 	/** Provider model id forwarded to model-scoped usage ranking/backoff. */
 	modelId?: string;
+	/**
+	 * What the call is for (`title`, `memory`, `vision`, ...). Managed Claude reports it to the host;
+	 * an unlabeled call is attributed to the main agent turn.
+	 */
+	purpose?: string;
 }
 
 /**
@@ -48,7 +53,7 @@ export interface ApiKeyResolverRegistry {
 	 * `resolveApiKeyOnce(resolver)`.
 	 */
 	resolver(provider: string, options?: ApiKeyResolverOptions): ApiKeyResolver;
-	resolver(model: ApiKeyResolverModel, sessionId?: string): ApiKeyResolver;
+	resolver(model: ApiKeyResolverModel, sessionId?: string, purpose?: string): ApiKeyResolver;
 }
 
 /**
@@ -117,6 +122,15 @@ export function createManagedApiKeyResolver(
 	adapter: ManagedAccountRoutingAdapter,
 	options: ApiKeyResolverOptions = {},
 ): ApiKeyResolver {
+	// The stream layer begins every managed call as an agent turn; a labeled resolver relabels it at the source.
+	const { purpose } = options;
+	const driver: NonNullable<ApiKeyResolver["managedRouting"]> = purpose
+		? {
+				beginCall: input => adapter.beginCall({ ...input, purpose }),
+				acquire: (call, acquireOptions) => adapter.acquire(call, acquireOptions),
+				isConfigured: grant => adapter.isConfigured(grant),
+			}
+		: adapter;
 	const resolve: ApiKeyResolver = async ctx => {
 		const call = ctx.managedCall;
 		if (!call) throw new ManagedDispatchRefusedError("unsupported_runtime");
@@ -139,7 +153,7 @@ export function createManagedApiKeyResolver(
 		if ("refusal" in result) throw new ManagedDispatchRefusedError(result.code, result.retryAfterMs);
 		return result;
 	};
-	return Object.assign(resolve, { managedRouting: adapter });
+	return Object.assign(resolve, { managedRouting: driver });
 }
 
 /** Resolver for a metadata-only launch: no provider, Claude or otherwise, may be dispatched. */

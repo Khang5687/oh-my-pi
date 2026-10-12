@@ -17,7 +17,7 @@
  */
 import { type AssistantMessage, completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
-import type { ModelRegistry } from "../config/model-registry";
+import { isModelAuthAvailable, type ModelRegistry } from "../config/model-registry";
 import { roleCandidatePool } from "../config/model-roles";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -79,9 +79,8 @@ export class SpeechEnhancer {
 				matchPreferences: getModelMatchPreferences(settings),
 			}).model;
 			if (!model) return null;
-			const apiKey = await registry.getApiKey(model, sessionId);
-			if (!apiKey) return null;
-			// Resolve metadata after getApiKey so the session-sticky credential is recorded first.
+			if (!(await isModelAuthAvailable(registry, model, sessionId))) return null;
+			// Resolve metadata after the auth guard so the session-sticky credential is recorded first.
 			const metadata = this.#deps.metadataResolver?.(model.provider);
 			const response = await retryTransientCompletion(
 				() => {
@@ -93,7 +92,7 @@ export class SpeechEnhancer {
 							messages: [{ role: "user", content: boundBlock(block), timestamp: Date.now() }],
 						},
 						{
-							apiKey: registry.resolver(model, sessionId),
+							apiKey: registry.resolver(model, sessionId, "other_auxiliary"),
 							sessionId,
 							maxTokens: ANSWER_MAX_TOKENS,
 							disableReasoning: true,

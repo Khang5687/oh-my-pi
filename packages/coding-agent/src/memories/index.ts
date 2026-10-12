@@ -15,7 +15,7 @@ import {
 	prompt,
 } from "@oh-my-pi/pi-utils";
 
-import type { ModelRegistry } from "../config/model-registry";
+import { isModelAuthAvailable, type ModelRegistry } from "../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { redactMemorySecrets as redactSecrets } from "../memory-backend/redact";
@@ -387,8 +387,7 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 			logger.debug("Phase1 skipped: no model available");
 			return;
 		}
-		const phase1ApiKey = await modelRegistry.getApiKey(phase1Model, session.sessionId);
-		if (!phase1ApiKey) {
+		if (!(await isModelAuthAvailable(modelRegistry, phase1Model, session.sessionId))) {
 			logger.debug("Phase1 skipped: no API key for phase1 model", {
 				provider: phase1Model.provider,
 				model: phase1Model.id,
@@ -424,7 +423,7 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 			const result = await runStage1Job({
 				claim,
 				model: phase1Model,
-				apiKey: modelRegistry.resolver(phase1Model, session.sessionId),
+				apiKey: modelRegistry.resolver(phase1Model, session.sessionId, "memory"),
 				sessionId: session.sessionId,
 				modelMaxTokens: computeModelTokenBudget(phase1Model, config),
 				config,
@@ -551,8 +550,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 			});
 			return;
 		}
-		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.sessionId);
-		if (!phase2ApiKey) {
+		if (!(await isModelAuthAvailable(modelRegistry, phase2Model, session.sessionId))) {
 			markPhase2FailureWithFallback(db, {
 				claim,
 				retryDelaySeconds: config.phase2RetryDelaySeconds,
@@ -587,7 +585,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 			const consolidated = await runConsolidationModel({
 				memoryRoot,
 				model: phase2Model,
-				apiKey: modelRegistry.resolver(phase2Model, session.sessionId),
+				apiKey: modelRegistry.resolver(phase2Model, session.sessionId, "memory"),
 				sessionId: session.sessionId,
 				metadata: session.agent?.metadataForProvider(phase2Model.provider),
 			});

@@ -20,7 +20,7 @@ import { isNativeRendering, onNativeRenderingChange } from "@oh-my-pi/pi-tui/nat
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { SPINNER_FRAMES } from "@oh-my-pi/pi-tui/theme/symbols";
 import { $env, isTerminalHeadless, isWsl, logger, prompt } from "@oh-my-pi/pi-utils";
-import type { ModelRegistry } from "../config/model-registry";
+import { isModelAuthAvailable, type ModelRegistry } from "../config/model-registry";
 
 import { roleCandidatePool } from "../config/model-roles";
 import { formatModelStringWithRouting } from "../config/model-resolver";
@@ -311,8 +311,7 @@ async function generateTitleOnlineWithModels(
 					registry.authStorage.sessions.pin(model.provider, sessionId, foregroundCredential.credentialId);
 				}
 			}
-			const apiKey = await registry.getApiKey(model, sessionId);
-			if (!apiKey) {
+			if (!(await isModelAuthAvailable(registry, model, sessionId))) {
 				logger.warn("title-generator: no API key", { ...modelContext, reason: "missing-api-key" });
 				continue;
 			}
@@ -323,7 +322,7 @@ async function generateTitleOnlineWithModels(
 				});
 				return null;
 			}
-			// Resolve metadata after getApiKey so the session-sticky credential for this
+			// Resolve metadata after the auth guard so the session-sticky credential for this
 			// request is already recorded; metadataResolver can then return the correct
 			// account_uuid rather than the snapshot-at-call-site value.
 			const metadata = metadataResolver?.(model.provider);
@@ -345,7 +344,7 @@ async function generateTitleOnlineWithModels(
 							messages,
 						},
 						{
-							apiKey: registry.resolver(model, sessionId),
+							apiKey: registry.resolver(model, sessionId, "title"),
 							sessionId,
 							maxTokens,
 							disableReasoning: true,

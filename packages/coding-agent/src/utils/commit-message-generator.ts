@@ -7,7 +7,7 @@ import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 
-import type { ModelRegistry } from "../config/model-registry";
+import { isModelAuthAvailable, type ModelRegistry } from "../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
@@ -101,8 +101,7 @@ export async function generateCommitMessage(
 	const userMessage = `<diff>\n${truncatedDiff}\n</diff>`;
 
 	for (const candidate of candidates) {
-		const apiKey = await registry.getApiKey(candidate.model, sessionId);
-		if (!apiKey) continue;
+		if (!(await isModelAuthAvailable(registry, candidate.model, sessionId))) continue;
 
 		try {
 			const maxTokens = COMMIT_MAX_TOKENS;
@@ -115,7 +114,7 @@ export async function generateCommitMessage(
 							messages: [{ role: "user", content: userMessage, timestamp: Date.now() }],
 						},
 						{
-							apiKey: registry.resolver(candidate.model, sessionId),
+							apiKey: registry.resolver(candidate.model, sessionId, "other_auxiliary"),
 							sessionId,
 							maxTokens,
 							reasoning: toReasoningEffort(candidate.thinkingLevel),
