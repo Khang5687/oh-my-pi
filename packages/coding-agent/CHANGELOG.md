@@ -7,6 +7,10 @@
 - Added `omp account-routing-capabilities [--mode metadata]`, a static JSON probe of managed account-routing support that exits before network bootstrap, auth, settings or model startup
 - Added host-owned Claude account routing to the RPC runtime for a process launched with `OMP_HOST_ACCOUNT_ROUTING`: `account.routing.configure`, `.refresh` and `.rank` commands, admission request/response, pause/resume and cancel frames, and a `get_state.accountRouting` projection. It stays off in released builds until all model-calling paths honor it, and an ordinary launch is unchanged
 
+### Changed
+
+- Changed host-owned Claude routing so session guards read credential metadata instead of resolving a token, and a Claude quota failure that reaches the session ends the turn without a native block, account rotation, reset redemption or model fallback; an ordinary launch is unchanged
+
 ## [18.10.1] - 2026-10-12
 
 ### Added

@@ -9,6 +9,7 @@ import { createMockModel, type MockModel, registerMockApi } from "@oh-my-pi/pi-a
 import { buildParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ManagedAccountRoutingAdapter } from "@oh-my-pi/pi-coding-agent/modes/rpc/account-routing";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { estimateToolSchemaTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -62,7 +63,15 @@ describe("AgentSession advisor context maintenance", () => {
 		await tempDir.remove();
 	});
 
-	function createHarness(contextPromotionTarget?: string, contextPromotionEnabled = false): MaintenanceHarness {
+	function createHarness(
+		contextPromotionTarget?: string,
+		contextPromotionEnabled = false,
+		advisorResponses: Parameters<typeof createMockModel>[0] extends infer O
+			? O extends { responses?: infer R }
+				? R
+				: never
+			: never = [{ content: ["advisor reviewed current update"] }],
+	): MaintenanceHarness {
 		const primaryMock = createMockModel({
 			provider: "anthropic",
 			responses: [{ content: ["primary complete"] }],
@@ -70,7 +79,7 @@ describe("AgentSession advisor context maintenance", () => {
 		const advisorMock = createMockModel({
 			provider: "anthropic",
 			contextWindow: CONTEXT_WINDOW,
-			responses: [{ content: ["advisor reviewed current update"] }],
+			responses: advisorResponses,
 		});
 		Object.assign(advisorMock, { contextPromotionTarget });
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
@@ -1065,5 +1074,73 @@ describe("AgentSession advisor context maintenance", () => {
 		// A report made after the rewrite describes the context as it is now.
 		advisor.state.messages.push(usageAnchor(advisorMock, prunedAt + 500));
 		expect(session.getAdvisorStats().contextTokens).toBeGreaterThanOrEqual(anchored);
+	});
+	/** Make the harness registry host-managed for Claude, with one credential known only by metadata. */
+	function manageClaude(registry: ModelRegistry): void {
+		const namespace = "22222222-2222-4222-8222-222222222222";
+		vi.spyOn(authStorage.credentials, "routingIdentities").mockReturnValue({
+			source: { status: "supported", storeNamespace: namespace, reason: null },
+			credentialGeneration: 1,
+			authoritativeObservedAt: null,
+			authoritativeComplete: true,
+			accounts: [
+				{
+					ref: { storeNamespace: namespace, nativeRowId: 1 },
+					provider: "anthropic",
+					accountId: "acc-a",
+					email: null,
+					organizationId: null,
+					organizationName: null,
+					credentialAvailable: true,
+				},
+			],
+		});
+		registry.useManagedRouting(new ManagedAccountRoutingAdapter("model", { completeCoverage: true }));
+	}
+
+	it("admits a managed Claude advisor compaction candidate from metadata and compacts through the resolver", async () => {
+		const { advisor, apiKeySpy, crossProviderModel, nativeModel, sameProviderModel } = createAdvisorFallbackHarness();
+		manageClaude(session.modelRegistry);
+		apiKeySpy.mockImplementation(async model => (model.provider === "anthropic" ? undefined : "test-key"));
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
+			if (model.provider === nativeModel.provider || model.provider === sameProviderModel.provider) {
+				throw new compactionModule.NativeCompactionError(
+					Object.assign(new Error("native compaction authentication failed"), { status: 401 }),
+				);
+			}
+			return {
+				summary: "managed claude summary",
+				shortSummary: "managed claude",
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: 42,
+			};
+		});
+
+		await session.prompt("small current update");
+
+		const claudeCall = compactSpy.mock.calls.find(([, model]) => model.provider === crossProviderModel.provider);
+		if (!claudeCall) throw new Error("Expected the Claude candidate to be compacted");
+		// The candidate was admitted without a raw bearer, and the call carries the managed resolver.
+		expect(typeof claudeCall[2]).toBe("function");
+		expect((claudeCall[2] as { managedRouting?: unknown }).managedRouting).toBeDefined();
+		expect(JSON.stringify(advisor.state.messages)).toContain("managed claude summary");
+	});
+
+	it("does not mark, rotate or fall back when a managed Claude advisor turn hits quota", async () => {
+		const markReached = vi.spyOn(authStorage.limits, "markReached").mockResolvedValue({ switched: false });
+		const rotate = vi.spyOn(authStorage.limits, "rotate").mockResolvedValue({ switched: false });
+		const { advisor, advisorMock, modelRegistry } = createHarness(undefined, false, [
+			{ throw: "429 usage_limit_reached" },
+		]);
+		manageClaude(modelRegistry);
+		// The failure under test is the provider's; keep the advisor off the (unconfigured) host admission wait.
+		advisor.getApiKey = () => "test-key";
+
+		await session.prompt("small current update");
+		await session.waitForIdle();
+
+		expect(advisorMock.calls.length).toBeGreaterThan(0);
+		expect(markReached).not.toHaveBeenCalled();
+		expect(rotate).not.toHaveBeenCalled();
 	});
 });

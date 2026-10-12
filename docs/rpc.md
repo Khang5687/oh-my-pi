@@ -1517,6 +1517,8 @@ Aborting a call, ending its session, replacing the epoch, or closing stdin makes
 
 `get_state` adds `accountRouting` (`{ version, hostEpoch, runtimeInstanceId, pendingAdmissions, pausedWaits, activeAdmissions }`) on a configured managed process and omits it otherwise. A call waiting on the host is running work: `isStreaming` stays `true`.
 
+Session recovery follows the same ownership. In a managed process a Claude quota or account-policy failure that reaches the session (the host refused, or output had already escaped so the call could not replay) is terminal for that turn: OMP does not mark a native credential blocked, rotate, redeem a reset credit, probe native usage health, or fall back to another model. Generic 429, auth and network failures keep the ordinary retry. Credential guards (prompt start, model cycling, compaction, handoff and advisor candidates) read credential metadata and never resolve a bearer; the raw `ModelRegistry` getters return no key for Claude, and the actual request goes through the admitted resolver.
+
 Limits: the host owns the decision to leave an account; OMP does not rebalance, rotate or mark durable quota blocks in this mode. Included-only admission rests on a fresh `usage credits disabled` observation (300000 ms) and the assumption that the setting stays off until the request completes; there is no per-request provider flag. Subscription tier is reported `unknown`.
 
 ## Error Model and Recoverability

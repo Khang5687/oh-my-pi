@@ -23,6 +23,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ManagedAccountRoutingAdapter } from "@oh-my-pi/pi-coding-agent/modes/rpc/account-routing";
 import { parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { parseModelPattern } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -40,6 +41,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
 
 import { cfgRetryUsageReservePolicy } from "@oh-my-pi/pi-coding-agent/session/settings";
@@ -7653,5 +7655,178 @@ describe("AgentSession retry fallback", () => {
 
 		expect(requestedModels).toContain("openrouter/z-ai/glm-4.7@chutes");
 		expect(getLastAssistantMessage(session).stopReason).not.toBe("error");
+	});
+});
+
+describe("AgentSession host-managed Claude routing", () => {
+	const NAMESPACE = "11111111-1111-4111-8111-111111111111";
+	let tempDir: TempDir;
+	let authStorage: AuthStorage;
+	let session: AgentSession | undefined;
+
+	beforeAll(async () => {
+		tempDir = TempDir.createSync("@pi-managed-session-guard-");
+		await initTheme();
+		authStorage = createInMemoryAuthStorage();
+		// A runtime key proves a raw getter would have produced a bearer for an unmanaged registry.
+		authStorage.keys.setRuntime("anthropic", "runtime-anthropic-token");
+		authStorage.keys.setRuntime("openai", "openai-test-key");
+	});
+
+	afterAll(() => {
+		authStorage.close();
+		tempDir.removeSync();
+	});
+
+	afterEach(async () => {
+		await session?.dispose();
+		session = undefined;
+		vi.restoreAllMocks();
+	});
+
+	function routingCatalog(credentialAvailable: boolean) {
+		return {
+			source: { status: "supported" as const, storeNamespace: NAMESPACE, reason: null },
+			credentialGeneration: 1,
+			authoritativeObservedAt: null,
+			authoritativeComplete: true,
+			accounts: [
+				{
+					ref: { storeNamespace: NAMESPACE, nativeRowId: 1 },
+					provider: "anthropic" as const,
+					accountId: "acc-a",
+					email: null,
+					organizationId: null,
+					organizationName: null,
+					credentialAvailable,
+				},
+			],
+		};
+	}
+
+	function managedRegistry(credentialAvailable = true): ModelRegistry {
+		vi.spyOn(authStorage.credentials, "routingIdentities").mockReturnValue(routingCatalog(credentialAvailable));
+		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		registry.useManagedRouting(new ManagedAccountRoutingAdapter("model", { completeCoverage: true }));
+		return registry;
+	}
+
+	function native() {
+		return {
+			markReached: vi.spyOn(authStorage.limits, "markReached").mockResolvedValue({ switched: false }),
+			rotate: vi.spyOn(authStorage.limits, "rotate").mockResolvedValue({ switched: false }),
+		};
+	}
+
+	function sessionFor(registry: ModelRegistry, throwOnAnthropic: string | undefined, requested: string[]) {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models to exist");
+		const mock = createMockModel();
+		let anthropicAttempts = 0;
+		const agent = new Agent({
+			getApiKey: () => "unused",
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				if (throwOnAnthropic && model.provider === "anthropic" && anthropicAttempts++ === 0)
+					mock.push({ throw: throwOnAnthropic });
+				else mock.push({ content: [`ok:${model.provider}`] });
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 2,
+			"retry.fallbackChains": { default: [`${fallback.provider}/${fallback.id}`] },
+		});
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: registry,
+		});
+		return session;
+	}
+
+	it("answers auth guards from credential metadata and never yields a raw bearer", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled test model");
+		const keysGet = vi.spyOn(authStorage.keys, "get");
+		const registry = managedRegistry();
+
+		expect(await registry.isAuthAvailable(model)).toBe(true);
+		expect(await registry.isProviderAuthAvailable("anthropic")).toBe(true);
+		expect(await registry.getApiKey(model)).toBeUndefined();
+		expect(await registry.getApiKeyForProvider("anthropic")).toBeUndefined();
+		expect(await registry.getApiKeyAndHeaders(model)).toMatchObject({ ok: false });
+		expect(keysGet).not.toHaveBeenCalled();
+
+		// Unmanaged providers on the same registry keep resolving keys.
+		const other = getBundledModel("openai", "gpt-4o-mini");
+		if (!other) throw new Error("Expected bundled test model");
+		expect(await registry.isAuthAvailable(other)).toBe(true);
+		expect(await registry.getApiKey(other)).toBe("openai-test-key");
+
+		vi.restoreAllMocks();
+		const empty = managedRegistry(false);
+		expect(await empty.isAuthAvailable(model)).toBe(false);
+		expect(await empty.isProviderAuthAvailable("anthropic")).toBe(false);
+	});
+
+	it("lets a prompt start on metadata availability alone", async () => {
+		const requested: string[] = [];
+		const live = sessionFor(managedRegistry(), undefined, requested);
+		await live.prompt("hello");
+		await live.waitForIdle();
+		expect(requested).toEqual(["anthropic/claude-sonnet-4-5"]);
+		expect(getLastAssistantMessage(live).stopReason).not.toBe("error");
+	});
+
+	it("treats a managed quota failure as terminal: no native mark, rotation or model fallback", async () => {
+		const spies = native();
+		const requested: string[] = [];
+		const live = sessionFor(managedRegistry(), "429 usage_limit_reached", requested);
+		const { retryStartEvents } = trackRetryEvents(live);
+
+		await live.prompt("Hit the quota");
+		await live.waitForIdle();
+
+		expect(requested).toEqual(["anthropic/claude-sonnet-4-5"]);
+		expect(spies.markReached).not.toHaveBeenCalled();
+		expect(spies.rotate).not.toHaveBeenCalled();
+		expect(retryStartEvents).toHaveLength(0);
+		expect(live.model?.provider).toBe("anthropic");
+		expect(getLastAssistantMessage(live).stopReason).toBe("error");
+	});
+
+	it("keeps ordinary recovery for the same failure on an unmanaged registry", async () => {
+		const spies = native();
+		spies.markReached.mockResolvedValue({ switched: true });
+		const requested: string[] = [];
+		const unmanaged = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		const live = sessionFor(unmanaged, "429 usage_limit_reached", requested);
+
+		await live.prompt("Hit the quota");
+		await live.waitForIdle();
+
+		expect(spies.markReached).toHaveBeenCalled();
+		expect(requested.length).toBeGreaterThan(1);
+	});
+
+	it("keeps the ordinary retry for generic overload on a managed registry", async () => {
+		const spies = native();
+		const requested: string[] = [];
+		const live = sessionFor(managedRegistry(), "overloaded_error: provider returned error 503", requested);
+
+		await live.prompt("Transient overload");
+		await live.waitForIdle();
+
+		expect(spies.markReached).not.toHaveBeenCalled();
+		expect(spies.rotate).not.toHaveBeenCalled();
+		expect(requested.length).toBeGreaterThan(1);
+		expect(getLastAssistantMessage(live).stopReason).not.toBe("error");
 	});
 });

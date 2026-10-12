@@ -26,7 +26,7 @@ import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { isUnexpectedSocketCloseMessage, logger, prompt, sleepLong } from "@oh-my-pi/pi-utils";
-import type { ModelRegistry } from "../config/model-registry";
+import { isModelAuthAvailable, type ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
 
 import type { Settings } from "../config/settings";
@@ -774,6 +774,8 @@ export class TurnRecovery {
 		const id = this.#classifyRetryMessage(message);
 		const activeModel = this.#host.model();
 		if (!activeModel || !AIError.is(id, AIError.Flag.UsageLimit)) return false;
+		// Managed Claude: no durable native block; the exhaustion belongs to the host-routed call.
+		if (this.#managedClaudeActive()) return false;
 
 		let recorded = this.#usageLimitOutcomes.get(message);
 		if (!recorded) {
@@ -1893,8 +1895,19 @@ export class TurnRecovery {
 		);
 	}
 
+	/**
+	 * Host-owned Claude routing settles quota inside the call: the host waits, re-admits or refuses. The
+	 * session therefore never marks a native credential, rotates, redeems a reset, probes native health
+	 * or falls back to another model on behalf of that account.
+	 */
+	#managedClaudeActive(): boolean {
+		const model = this.#host.model();
+		return model !== undefined && this.#host.modelRegistry.isManagedClaude(model.provider);
+	}
+
 	async #maybeApplyUsageAwareFallback(signal: AbortSignal, confirmer?: UsageFallbackConfirmer): Promise<boolean> {
 		if (!cfgRetryUsageAwareFallback.get(this.#host.settings)) return false;
+		if (this.#managedClaudeActive()) return false;
 		const currentModel = this.#host.model();
 		if (!currentModel) return false;
 		const sessionId = this.#host.sessionManager.getSessionId();
@@ -1952,7 +1965,7 @@ export class TurnRecovery {
 		}
 		if (!cfgRetryModelFallback.get(this.#host.settings)) return false;
 
-		let fallback: { role: string; selector: RetryFallbackSelector; apiKey: string } | undefined;
+		let fallback: { role: string; selector: RetryFallbackSelector } | undefined;
 		const ceiling = this.#host.thinkingLevelCeiling();
 		const chainKeys = this.retryFallbackChainKeys(currentSelector, currentModel);
 		for (const role of chainKeys) {
@@ -1997,16 +2010,23 @@ export class TurnRecovery {
 					// Unknown usage fails open for an otherwise valid fallback.
 				}
 				if (signal.aborted || !modelsAreEqual(this.#host.model(), currentModel)) return false;
-				let apiKey: string | undefined;
+				let authAvailable: boolean;
 				try {
-					apiKey = await this.#host.modelRegistry.getApiKey(candidateModel, this.#host.sessionId(), { signal });
+					authAvailable = await isModelAuthAvailable(
+						this.#host.modelRegistry,
+						candidateModel,
+						this.#host.sessionId(),
+						{
+							signal,
+						},
+					);
 				} catch {
 					if (signal.aborted || !modelsAreEqual(this.#host.model(), currentModel)) return false;
 					continue;
 				}
 				if (signal.aborted || !modelsAreEqual(this.#host.model(), currentModel)) return false;
-				if (!apiKey) continue;
-				fallback = { role, selector: candidate, apiKey };
+				if (!authAvailable) continue;
+				fallback = { role, selector: candidate };
 				break;
 			}
 			if (fallback) break;
@@ -2045,7 +2065,7 @@ export class TurnRecovery {
 		this.#usageReserveApproval = undefined;
 		return this.applyRetryFallbackCandidate(fallback.role, fallback.selector, currentSelector, {
 			pinFallback: true,
-			apiKey: fallback.apiKey,
+			authChecked: true,
 			signal,
 			reason: describeUsageFallback(health, cfgRetryUsageReservePct.get(this.#host.settings)),
 		});
@@ -2093,17 +2113,26 @@ export class TurnRecovery {
 		role: string,
 		selector: RetryFallbackSelector,
 		currentSelector: string,
-		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal; reason?: string },
+		options?: {
+			pinFallback?: boolean;
+			apiKey?: string;
+			authChecked?: boolean;
+			signal?: AbortSignal;
+			reason?: string;
+		},
 	): Promise<boolean> {
 		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 		const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 		if (!candidate) {
 			throw new Error(`Retry fallback model not found: ${selector.raw}`);
 		}
-		const apiKey =
-			options?.apiKey ??
-			(await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId(), { signal: options?.signal }));
-		if (!apiKey) {
+		const authAvailable =
+			options?.authChecked === true ||
+			Boolean(options?.apiKey) ||
+			(await isModelAuthAvailable(this.#host.modelRegistry, candidate, this.#host.sessionId(), {
+				signal: options?.signal,
+			}));
+		if (!authAvailable) {
 			throw new Error(`No API key for retry fallback ${selector.raw}`);
 		}
 		if (options?.signal?.aborted) return false;
@@ -2254,8 +2283,7 @@ export class TurnRecovery {
 				if (!this.#host.contextFitsModel(candidate, options?.preserveFailedTurn ? undefined : failedMessage)) {
 					continue;
 				}
-				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
-				if (!apiKey) continue;
+				if (!(await isModelAuthAvailable(this.#host.modelRegistry, candidate, this.#host.sessionId()))) continue;
 				const previousEditMode = this.#host.resolveActiveEditMode();
 				const applied = await this.applyRetryFallbackCandidate(role, selector, currentSelector, {
 					...options,
@@ -2364,8 +2392,7 @@ export class TurnRecovery {
 		if (!model) return false;
 		const baseModel = this.#host.modelRegistry.find("fireworks", toFireworksBaseModelId(model.id));
 		if (!baseModel) return false;
-		const apiKey = await this.#host.modelRegistry.getApiKey(baseModel, this.#host.sessionId());
-		if (!apiKey) return false;
+		if (!(await isModelAuthAvailable(this.#host.modelRegistry, baseModel, this.#host.sessionId()))) return false;
 		const baseSelector = formatModelStringWithRouting(baseModel);
 		const previousEditMode = this.#host.resolveActiveEditMode();
 		// A capability degrade is fallback routing too, even though it arms no
@@ -2425,8 +2452,7 @@ export class TurnRecovery {
 		const primaryModel =
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
 		if (!primaryModel) return false;
-		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, this.#host.sessionId());
-		if (!apiKey) return false;
+		if (!(await isModelAuthAvailable(this.#host.modelRegistry, primaryModel, this.#host.sessionId()))) return false;
 
 		const currentThinkingLevel = this.#host.configuredThinkingLevel();
 		const thinkingToApply =
@@ -2492,6 +2518,14 @@ export class TurnRecovery {
 		// not a retry loop, so it runs even when the user disabled retries: it switches
 		// the model once and lets the base turn proceed.
 		if (!retrySettings.enabled && !options?.fireworksFastFallback) return false;
+		// Managed Claude quota/account-policy failures are terminal here: no rotation, reset redemption or
+		// model fallback. Generic 429, auth and network errors keep the ordinary retry policy.
+		if (this.#managedClaudeActive()) {
+			const managedId = this.#classifyRetryMessage(message);
+			if (AIError.is(managedId, AIError.Flag.UsageLimit) || AIError.is(managedId, AIError.Flag.AccountPolicy)) {
+				return false;
+			}
+		}
 		const classifierRefusal = this.isClassifierRefusal(message);
 
 		const generation = this.#host.promptGeneration();

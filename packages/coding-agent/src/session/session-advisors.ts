@@ -74,7 +74,7 @@ import {
 	slugifyAdvisorName,
 } from "../advisor";
 import { evictStaleToolResults } from "../advisor/tool-result-eviction";
-import type { ModelRegistry } from "../config/model-registry";
+import { isModelAuthAvailable, type ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
 	formatModelStringWithRouting,
@@ -2031,8 +2031,8 @@ export class SessionAdvisors {
 		const primaryModel =
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
 		if (!primaryModel || !this.#canReplayAdvisorHistory(advisor, primaryModel)) return;
-		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, advisor.providerSessionId, { signal });
-		if (!apiKey) return;
+		if (!(await isModelAuthAvailable(this.#host.modelRegistry, primaryModel, advisor.providerSessionId, { signal })))
+			return;
 		signal.throwIfAborted();
 
 		// An `auto` advisor skipped the retune while on the fallback: rejoin the
@@ -2088,6 +2088,15 @@ export class SessionAdvisors {
 		}
 
 		const accountPolicyDenial = AIError.is(errorId, AIError.Flag.AccountPolicy);
+		// Host-owned Claude routing settles quota inside the call; no rotation, native mark or fallback here.
+		if (
+			this.#host.modelRegistry.isManagedClaude(currentModel.provider) &&
+			(accountPolicyDenial ||
+				AIError.is(errorId, AIError.Flag.UsageLimit) ||
+				isUsageLimitOutcome(extractHttpStatusFromError(error), message))
+		) {
+			return false;
+		}
 		if (accountPolicyDenial) {
 			const rotation = await this.#host.modelRegistry.authStorage.limits.rotate(
 				currentModel.provider,
@@ -2183,8 +2192,11 @@ export class SessionAdvisors {
 				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 				if (!candidate || modelsAreEqual(candidate, currentModel)) continue;
 				if (!this.#canReplayAdvisorHistory(advisor, candidate)) continue;
-				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, { signal });
-				if (!apiKey) continue;
+				if (
+					!(await isModelAuthAvailable(this.#host.modelRegistry, candidate, advisor.providerSessionId, { signal }))
+				) {
+					continue;
+				}
 				signal.throwIfAborted();
 
 				const originalThinkingLevel = advisor.thinkingLevel;
@@ -2478,8 +2490,8 @@ export class SessionAdvisors {
 		});
 
 		for (const candidate of candidates) {
-			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisorProviderSessionId, { signal });
-			if (!apiKey) continue;
+			if (!(await isModelAuthAvailable(this.#host.modelRegistry, candidate, advisorProviderSessionId, { signal })))
+				continue;
 			if (
 				nativeCompactionFailure &&
 				(candidate.provider !== nativeCompactionFailure.provider ||

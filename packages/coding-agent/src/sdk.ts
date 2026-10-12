@@ -62,7 +62,7 @@ import type { EffectiveExtensionRoots } from "./capability/types";
 import { type OAuthAccountPools, SessionAccountPoolScope } from "./config/account-pools";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
-import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
+import { ModelRegistry, probeModelAuth } from "./config/model-registry";
 import {
 	disabledProviderIds,
 	formatModelString,
@@ -3002,7 +3002,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				if (
 					((modelFallbackEnabled && (hasUsageFallbackCandidate || usageFallbackTriggered)) ||
 						usageReservePolicy === "fail-closed") &&
-					cfgRetryUsageAwareFallback.get(settings)
+					cfgRetryUsageAwareFallback.get(settings) &&
+					// Host-owned Claude routing: native usage health is not consulted for model choice.
+					!(managedRouting && primary.model.provider === "anthropic")
 				) {
 					let usageHealth: ModelUsageHealth | undefined;
 					try {
@@ -3070,16 +3072,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 				let authFallbackUsed = false;
 				if (options.modelPatternAuthFallback) {
-					const primaryKey = await modelRegistry.getApiKey(primary.model);
-					if (primaryKey !== kNoAuth && !isAuthenticated(primaryKey)) {
+					if (!(await probeModelAuth(modelRegistry, primary.model)).available) {
 						const fallback = parseModelPattern(
 							options.modelPatternAuthFallback,
 							resolutionModels,
 							matchPreferences,
 						);
 						if (fallback.model) {
-							const fallbackKey = await modelRegistry.getApiKey(fallback.model);
-							if (isAuthenticated(fallbackKey)) {
+							if ((await probeModelAuth(modelRegistry, fallback.model)).authenticated) {
 								selectedModel = fallback.model;
 								selectedThinkingLevel = fallback.thinkingLevel;
 								selectedExplicitThinkingLevel = fallback.explicitThinkingLevel;
@@ -4187,7 +4187,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const blobBroker = new LiveImageUrlService(
 			settings,
 			() => sessionManager.getCwd(),
-			model => modelRegistry.getApiKey(model, providerSessionId),
+			// Provider file uploads would need a raw bearer; managed Claude has none, so uploads are skipped.
+			async model =>
+				managedRouting && model.provider === "anthropic"
+					? undefined
+					: modelRegistry.getApiKey(model, providerSessionId),
 		);
 		disposeCallbacks.add(() => blobBroker.dispose());
 		const dateCwdReminder = new DateCwdReminderInjector();

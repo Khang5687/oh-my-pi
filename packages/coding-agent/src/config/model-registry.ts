@@ -304,6 +304,37 @@ export type ResolvedRequestAuth =
 /**
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
  */
+/**
+ * Guard-only auth check: can this model be called at all? Managed Claude answers from credential
+ * metadata and never yields a key. Accepts a minimal registry (a registry without managed support
+ * resolves a key exactly as {@link ModelRegistry.getApiKey} does).
+ */
+export async function isModelAuthAvailable(
+	registry: Pick<ModelRegistry, "getApiKey"> & Partial<Pick<ModelRegistry, "isManagedClaude" | "isAuthAvailable">>,
+	model: Model<Api>,
+	sessionId?: string,
+	options?: { signal?: AbortSignal },
+): Promise<boolean> {
+	if (registry.isManagedClaude?.(model.provider) && registry.isAuthAvailable) {
+		return registry.isAuthAvailable(model, sessionId, options);
+	}
+	return Boolean(await registry.getApiKey(model, sessionId, options));
+}
+
+/** Like {@link isModelAuthAvailable}, also telling a concrete credential apart from a keyless endpoint. */
+export async function probeModelAuth(
+	registry: Pick<ModelRegistry, "getApiKey"> & Partial<Pick<ModelRegistry, "isManagedClaude" | "isAuthAvailable">>,
+	model: Model<Api>,
+	sessionId?: string,
+): Promise<{ available: boolean; authenticated: boolean }> {
+	if (registry.isManagedClaude?.(model.provider) && registry.isAuthAvailable) {
+		const available = await registry.isAuthAvailable(model, sessionId);
+		return { available, authenticated: available };
+	}
+	const key = await registry.getApiKey(model, sessionId);
+	return { available: Boolean(key), authenticated: isAuthenticated(key) };
+}
+
 export class ModelRegistry {
 	#managedRouting: ManagedAccountRoutingAdapter | undefined;
 	#models: Model<Api>[] = [];
@@ -3253,6 +3284,7 @@ export class ModelRegistry {
 		// A disabled provider gets no credential, so no request reaches it however
 		// its model was obtained.
 		if (this.#isProviderDisabled(model.provider)) return undefined;
+		if (this.isManagedClaude(model.provider)) return undefined;
 		if (this.#isKeylessProvider(model.provider)) {
 			return kNoAuth;
 		}
@@ -3262,6 +3294,43 @@ export class ModelRegistry {
 			accountIds: model.accountAccess && Object.keys(model.accountAccess),
 			signal: options?.signal,
 		});
+	}
+
+	/**
+	 * Whether `provider` is served by host-owned Claude routing. Raw credential getters never produce a
+	 * bearer for it: the host picks the account per request and the strict resolver releases the bearer.
+	 */
+	isManagedClaude(provider: string): boolean {
+		return provider === "anthropic" && this.#managedRouting !== undefined;
+	}
+
+	/**
+	 * Metadata-only availability for host-managed Claude: some loaded OAuth row has a usable credential.
+	 * Reads the pool's identity view; it never resolves, refreshes or returns token material.
+	 */
+	#managedClaudeAvailable(): boolean {
+		const catalog = this.authStorage.credentials.routingIdentities({ provider: "anthropic" });
+		return catalog.accounts.some(account => account.credentialAvailable);
+	}
+
+	/**
+	 * Guard-only availability: can this model be called at all? Unmanaged providers resolve a key exactly
+	 * as {@link getApiKey} does. Managed Claude answers from credential metadata, so a guard never
+	 * produces a token and never touches refresh or quota state.
+	 */
+	async isAuthAvailable(model: Model<Api>, sessionId?: string, options?: { signal?: AbortSignal }): Promise<boolean> {
+		if (this.isManagedClaude(model.provider)) {
+			return !this.#isProviderDisabled(model.provider) && this.#managedClaudeAvailable();
+		}
+		return Boolean(await this.getApiKey(model, sessionId, options));
+	}
+
+	/** Provider-keyed {@link isAuthAvailable}; a transient OAuth refresh failure reads as unavailable. */
+	async isProviderAuthAvailable(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<boolean> {
+		if (this.isManagedClaude(provider)) {
+			return !this.#isProviderDisabled(provider) && this.#managedClaudeAvailable();
+		}
+		return Boolean(await this.getApiKeyForProvider(provider, sessionId, options));
 	}
 
 	/** Resolve request authentication through the historical Pi extension facade. */
@@ -3314,6 +3383,7 @@ export class ModelRegistry {
 		options?: AuthApiKeyOptions,
 	): Promise<ResolvedApiKey | undefined> {
 		if (this.#isProviderDisabled(provider)) return undefined;
+		if (this.isManagedClaude(provider)) return undefined;
 		if (options?.forceRefresh) this.#invalidateProviderCommandConfigs(provider);
 		if (this.#isKeylessProvider(provider)) {
 			return { apiKey: kNoAuth };

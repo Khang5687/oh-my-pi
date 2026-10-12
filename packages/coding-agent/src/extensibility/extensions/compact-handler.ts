@@ -6,6 +6,7 @@
  * union so the same adapter can be reused by print-mode, rpc-mode, and the executor.
  */
 import type { Model } from "@oh-my-pi/pi-ai";
+import { isModelAuthAvailable } from "../../config/model-registry";
 import type { CompactOptions } from "./types";
 
 interface CompactableSession {
@@ -23,7 +24,7 @@ export async function runExtensionCompact(
 }
 
 interface SetModelCapableSession {
-	modelRegistry: { getApiKey(model: Model): Promise<string | undefined> };
+	modelRegistry: Parameters<typeof isModelAuthAvailable>[0];
 	setModel(model: Model): Promise<unknown>;
 }
 
@@ -33,8 +34,7 @@ interface SetModelCapableSession {
  * Returns false when no API key is available for the requested model.
  */
 export async function runExtensionSetModel(session: SetModelCapableSession, model: Model): Promise<boolean> {
-	const key = await session.modelRegistry.getApiKey(model);
-	if (!key) return false;
+	if (!(await isModelAuthAvailable(session.modelRegistry, model))) return false;
 	await session.setModel(model);
 	return true;
 }
