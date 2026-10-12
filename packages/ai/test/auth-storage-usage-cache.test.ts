@@ -19,7 +19,14 @@ import {
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai/auth-storage";
 import { usageCacheIdentity } from "@oh-my-pi/pi-ai/auth/usage-cache";
-import type { UsageLimit, UsageProvider, UsageReport } from "@oh-my-pi/pi-ai/usage";
+import {
+	currentIncludedBilling,
+	readRoutingObservation,
+	type RoutingObservation,
+	type UsageLimit,
+	type UsageProvider,
+	type UsageReport,
+} from "@oh-my-pi/pi-ai/usage";
 import { alibabaTokenPlanUsageProvider } from "@oh-my-pi/pi-ai/usage/alibaba-token-plan";
 import * as claudeUsage from "@oh-my-pi/pi-ai/usage/claude";
 import { serializeAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
@@ -235,19 +242,19 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 	});
 
 	it("cold-fetches instead of replaying a report stored under the previous Anthropic cache version", async () => {
-		const previousVersionKey = "usage_cache:report:2:anthropic:default:oauth|account:account-1|email:a@example.com";
+		const previousVersionKey = "usage_cache:report:3:anthropic:default:oauth|account:account-1|email:a@example.com";
 		store.cache.set(previousVersionKey, {
 			value: JSON.stringify({ value: makeReport("a@example.com"), expiresAt: Date.now() + 60_000 }),
 			expiresAtSec: Math.floor((Date.now() + 24 * 60 * 60_000) / 1000),
 		});
 		const base = makeReport("a@example.com");
-		const freshReport = { ...base, metadata: { ...base.metadata, source: "fresh-v3-fetch" } };
+		const freshReport = { ...base, metadata: { ...base.metadata, source: "fresh-v4-fetch" } };
 		const fetchSpy = vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue(freshReport);
 
 		const reports = anthropicReports(await storage.usage.reports());
 
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
-		expect(reports[0]?.metadata?.source).toBe("fresh-v3-fetch");
+		expect(reports[0]?.metadata?.source).toBe("fresh-v4-fetch");
 	});
 
 	it("uses the configured usage provider's cache version instead of the built-in version", async () => {
@@ -1337,7 +1344,7 @@ describe("AuthStorage usage cache: terminal refresh failure", () => {
 		if (row.credential.type !== "oauth") throw new Error("expected OAuth test credential");
 		row.credential.expires = Date.now() - 1000;
 		const store = makeStore([row]);
-		const cacheKey = "usage_cache:report:3:anthropic:default:oauth|account:account-3|email:expired@example.com";
+		const cacheKey = "usage_cache:report:4:anthropic:default:oauth|account:account-3|email:expired@example.com";
 		store.cache.set(cacheKey, {
 			value: JSON.stringify({ value: makeReport("expired@example.com"), expiresAt: 1 }),
 			expiresAtSec: Math.floor((Date.now() + 24 * 60 * 60_000) / 1000),
@@ -1397,7 +1404,7 @@ describe("AuthStorage usage cache: terminal refresh failure", () => {
 		};
 
 		const lastGood = makeReport("b@example.com");
-		const cacheKey = "usage_cache:report:3:anthropic:default:oauth|account:account-2|email:b@example.com";
+		const cacheKey = "usage_cache:report:4:anthropic:default:oauth|account:account-2|email:b@example.com";
 		cache.set(cacheKey, {
 			value: JSON.stringify({ value: lastGood, expiresAt: 1 }),
 			expiresAtSec: Math.floor((Date.now() + 24 * 60 * 60_000) / 1000),
@@ -1500,3 +1507,251 @@ describe("AuthStorage usage cache: organization scope identity", () => {
 		expect(key).not.toBe(usageCacheIdentity({ ...credential, inferenceRegion: "global" }));
 	});
 });
+
+describe("AuthStorage usage cache: routing billing observation", () => {
+	const NAMESPACE = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+	const CANONICAL = "https://api.anthropic.com/api/oauth/usage";
+	const NOW = 1_800_000_000_000;
+	const BASE_URL = "https://api.anthropic.com/v1";
+
+	function fullPayload(spendEnabled: boolean, accountId = "account-1") {
+		return {
+			account_id: accountId,
+			five_hour: { utilization: 30 },
+			seven_day: { utilization: 60 },
+			spend: { enabled: spendEnabled },
+		};
+	}
+
+	function makeSource(rows: StoredAuthCredential[], namespace: string | null = NAMESPACE): ObservableStore {
+		return Object.assign(makeStore(rows), {
+			routingSourceIdentity: () =>
+				namespace === null
+					? ({ status: "unsupported", storeNamespace: null, reason: "namespace_unavailable" } as const)
+					: ({ status: "supported", storeNamespace: namespace, reason: null } as const),
+		});
+	}
+
+	async function open(store: ObservableStore, usageFetch?: typeof fetch) {
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+			...(usageFetch ? { usageFetch } : {}),
+		});
+		await storage.credentials.reload();
+		return storage;
+	}
+
+	function seedReport(store: ObservableStore, payload: unknown, nowMs: number, endpoint = CANONICAL): void {
+		const report = claudeUsage.parseClaudeUsagePayload(
+			payload,
+			{ accountId: "account-1", email: "a@example.com" },
+			endpoint,
+			nowMs,
+		);
+		store.cache.set("usage_cache:report:4:anthropic:default:oauth|account:account-1|email:a@example.com", {
+			value: JSON.stringify({ value: report, expiresAt: Date.now() + 60_000 }),
+			expiresAtSec: Math.floor((Date.now() + 24 * 60 * 60_000) / 1000),
+		});
+	}
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("peeks a loaded local report bound to its source and row without any fetch or refresh", async () => {
+		const store = makeSource([oauthRow(1, "a@example.com")]);
+		let fetchCalls = 0;
+		const storage = await open(store, (async () => {
+			fetchCalls += 1;
+			return new Response("{}");
+		}) as unknown as typeof fetch);
+		const fetchSpy = vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage");
+		seedReport(store, fullPayload(false), NOW);
+		try {
+			const peeked = storage.usage.peekByCredentialId({ provider: "anthropic", credentialId: 1, baseUrl: BASE_URL });
+			const observation = readRoutingObservation(peeked);
+			expect(observation).toMatchObject({
+				storeNamespace: NAMESPACE,
+				nativeRowId: 1,
+				billing: { state: "disabled", observedAt: NOW, validUntil: NOW + 300_000 },
+			});
+			expect(fetchSpy).not.toHaveBeenCalled();
+			expect(fetchCalls).toBe(0);
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("returns null for a missing namespace, row, hook data, endpoint or identity mismatch", async () => {
+		const peek = (storage: AuthStorage, credentialId = 1, baseUrl = BASE_URL) =>
+			storage.usage.peekByCredentialId({ provider: "anthropic", credentialId, baseUrl });
+
+		const noNamespace = makeSource([oauthRow(1, "a@example.com")], null);
+		seedReport(noNamespace, fullPayload(false), NOW);
+		const storageA = await open(noNamespace);
+		expect(peek(storageA)).toBeNull();
+		storageA.close();
+
+		const store = makeSource([oauthRow(1, "a@example.com")]);
+		const storageB = await open(store);
+		expect(peek(storageB)).toBeNull(); // cold cache
+		seedReport(store, fullPayload(false), NOW);
+		expect(peek(storageB, 2)).toBeNull(); // unknown row
+		expect(peek(storageB, 1, "https://gateway.example.com/v1")).toBeNull(); // endpoint mismatch
+		expect(peek(storageB)).not.toBeNull();
+		storageB.close();
+
+		const mismatched = makeSource([oauthRow(1, "a@example.com")]);
+		seedReport(mismatched, fullPayload(false, "other-account"), NOW);
+		const parsed = JSON.parse(
+			mismatched.cache.get("usage_cache:report:4:anthropic:default:oauth|account:account-1|email:a@example.com")!
+				.value,
+		);
+		// The parser already refused the billing state; the peek additionally refuses the foreign response ids.
+		expect(parsed.value.metadata.routingObservation.billing.state).toBe("unknown");
+		const storageC = await open(mismatched);
+		expect(peek(storageC)).toBeNull();
+		storageC.close();
+	});
+
+	it("prefers a remote store's own peek hook and never touches the local cache", async () => {
+		const store = makeSource([oauthRow(1, "a@example.com")]);
+		const stored = claudeUsage.parseClaudeUsagePayload(
+			fullPayload(true),
+			{ accountId: "account-1", email: "a@example.com" },
+			CANONICAL,
+			NOW,
+		);
+		const calls: unknown[] = [];
+		store.peekUsageByCredentialId = request => {
+			calls.push(request);
+			return stored;
+		};
+		const storage = await open(store);
+		try {
+			const peeked = storage.usage.peekByCredentialId({ provider: "anthropic", credentialId: 1, baseUrl: BASE_URL });
+			expect(calls).toEqual([{ provider: "anthropic", credentialId: 1, baseUrl: BASE_URL }]);
+			expect(readRoutingObservation(peeked)?.billing.state).toBe("enabled");
+			store.peekUsageByCredentialId = () => null;
+			expect(
+				storage.usage.peekByCredentialId({ provider: "anthropic", credentialId: 1, baseUrl: BASE_URL }),
+			).toBeNull();
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("keeps disabled billing through header merges and expires it at exactly 300000ms", async () => {
+		const store = makeSource([oauthRow(1, "a@example.com")]);
+		const storage = await open(store);
+		const nowSpy = vi.spyOn(Date, "now").mockReturnValue(NOW);
+		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue(
+			claudeUsage.parseClaudeUsagePayload(
+				{
+					...fullPayload(false),
+					seven_day: { utilization: 60, resets_at: new Date(NOW + 86_400_000).toISOString() },
+				},
+				{ accountId: "account-1", email: "a@example.com" },
+				CANONICAL,
+				NOW,
+			),
+		);
+		try {
+			await storage.usage.reports();
+			await storage.keys.get("anthropic", "billing-session");
+			nowSpy.mockReturnValue(NOW + 200_000);
+			expect(
+				storage.usage.ingestHeaders("anthropic", usageHeaders("0.05", "0.9"), { sessionId: "billing-session" }),
+			).toBe(true);
+			const read = (nowMs: number) => {
+				const observation = readRoutingObservation(
+					storage.usage.peekByCredentialId({ provider: "anthropic", credentialId: 1, baseUrl: BASE_URL }),
+				);
+				if (!observation) throw new Error("expected observation");
+				return { billing: currentIncludedBilling(observation.billing, nowMs), observation };
+			};
+			const merged = read(NOW + 299_999);
+			expect(merged.billing).toMatchObject({ state: "disabled", observedAt: NOW });
+			expect(merged.observation.billing.observedAt).toBe(NOW);
+			const windows = new Map(merged.observation.windowObservations.map(window => [window.id, window]));
+			expect(windows.get("anthropic:5h")).toMatchObject({ source: "usage-header", usedFraction: 0.05 });
+			expect(windows.get("anthropic:7d")).toMatchObject({ source: "usage-header", usedFraction: 0.9 });
+			expect(read(NOW + 300_000).billing).toMatchObject({ state: "unknown", reason: "expired" });
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("does not renew an expired disabled observation from a retained last-good report after a failed read", async () => {
+		const store = makeSource([oauthRow(1, "a@example.com")]);
+		seedReport(store, fullPayload(false), Date.now() - 400_000);
+		const entry = store.cache.get(
+			"usage_cache:report:4:anthropic:default:oauth|account:account-1|email:a@example.com",
+		)!;
+		store.cache.set("usage_cache:report:4:anthropic:default:oauth|account:account-1|email:a@example.com", {
+			...entry,
+			value: JSON.stringify({ ...JSON.parse(entry.value), expiresAt: 1 }),
+		});
+		const storage = await open(store);
+		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue(null);
+		try {
+			const report = requireAnthropicReport(await storage.usage.reports());
+			const observation = readRoutingObservation(report);
+			expect(observation?.billing.state).toBe("disabled");
+			expect(currentIncludedBilling(observation!.billing, Date.now()).state).toBe("unknown");
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("refreshes one exact row from a stubbed full response with exactly one request and no cache write", async () => {
+		const store = makeSource([oauthRow(1, "a@example.com"), oauthRow(2, "b@example.com")]);
+		const urls: string[] = [];
+		const storage = await open(store, (async (input: string | URL | Request) => {
+			urls.push(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+			return new Response(JSON.stringify(fullPayload(false)), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		}) as unknown as typeof fetch);
+		const cacheBefore = store.cache.size;
+		try {
+			const usage = storage.usage as unknown as { refreshRoutingObservation: AuthStorageUsageRefresh };
+			const observation = await usage.refreshRoutingObservation({
+				binding: { storeNamespace: NAMESPACE, nativeRowId: 1, accountId: "account-1", organizationId: null },
+				credential: { type: "oauth", accessToken: "oat-1", accountId: "account-1", email: "a@example.com" },
+				modelId: null,
+				baseUrl: BASE_URL,
+				nowMs: NOW,
+			});
+			expect(observation).toMatchObject({
+				storeNamespace: NAMESPACE,
+				nativeRowId: 1,
+				billing: { state: "disabled", observedAt: NOW, validUntil: NOW + 300_000 },
+			});
+			expect(urls.filter(url => url === CANONICAL)).toHaveLength(1);
+			expect(urls.every(url => !url.includes("oat-2"))).toBe(true);
+			expect(store.cache.size).toBe(cacheBefore);
+
+			const foreign = await usage.refreshRoutingObservation({
+				binding: { storeNamespace: NAMESPACE, nativeRowId: 1, accountId: "another-account", organizationId: null },
+				credential: { type: "oauth", accessToken: "oat-1", accountId: "account-1", email: "a@example.com" },
+				modelId: null,
+				baseUrl: BASE_URL,
+				nowMs: NOW,
+			});
+			expect(foreign?.billing).toMatchObject({ state: "unknown", reason: "identity_mismatch" });
+		} finally {
+			storage.close();
+		}
+	});
+});
+
+type AuthStorageUsageRefresh = (args: {
+	binding: { storeNamespace: string; nativeRowId: number; accountId: string | null; organizationId: string | null };
+	credential: { type: "oauth"; accessToken: string; accountId?: string; email?: string };
+	modelId: string | null;
+	baseUrl: string;
+	signal?: AbortSignal;
+	nowMs: number;
+}) => Promise<RoutingObservation | null>;

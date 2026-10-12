@@ -1,7 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { getClaudeCodeVersion } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
-import type { UsageFetchContext, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai/usage";
-import { claudeRankingStrategy, claudeUsageProvider } from "@oh-my-pi/pi-ai/usage/claude";
+import {
+	currentIncludedBilling,
+	mergeHeaderRoutingObservation,
+	readRoutingObservation,
+	type UsageFetchContext,
+	type UsageLimit,
+	type UsageReport,
+} from "@oh-my-pi/pi-ai/usage";
+import { claudeRankingStrategy, claudeUsageProvider, parseClaudeUsagePayload } from "@oh-my-pi/pi-ai/usage/claude";
 
 function getHeaderCaseInsensitive(
 	headers: Headers | Record<string, string | ReadonlyArray<string>> | string[][] | undefined,
@@ -997,5 +1004,71 @@ describe("claude ranking strategy", () => {
 		expect(claudeRankingStrategy.findWindowLimits(report, { modelId: "claude-fable-5" }).secondary?.id).toBe(
 			"anthropic:7d",
 		);
+	});
+});
+
+describe("Claude rate-limit headers and routing observation", () => {
+	const NOW = 1_800_000_000_000;
+	const headers = {
+		"anthropic-ratelimit-unified-5h-utilization": "0.25",
+		"anthropic-ratelimit-unified-5h-reset": String(Math.floor(NOW / 1000) + 3600),
+	};
+
+	it("header reports carry usage-header windows and never any billing evidence", () => {
+		const report = claudeUsageProvider.parseRateLimitHeaders?.(headers, NOW);
+		const observation = readRoutingObservation(report);
+		expect(observation?.billing).toMatchObject({ state: "unknown", observedAt: null, validUntil: null });
+		expect(observation?.windowObservations).toMatchObject([
+			{ id: "anthropic:5h", source: "usage-header", observedAt: NOW, usedFraction: 0.25, scope: { kind: "shared" } },
+		]);
+	});
+
+	it("merging header windows keeps the full-response billing and its original timestamp", () => {
+		const full = parseClaudeUsagePayload(
+			{ five_hour: { utilization: 10 }, seven_day: { utilization: 20 }, spend: { enabled: false } },
+			{},
+			"https://api.anthropic.com/api/oauth/usage",
+			NOW,
+		);
+		const prior = readRoutingObservation(full);
+		const header = readRoutingObservation(claudeUsageProvider.parseRateLimitHeaders?.(headers, NOW + 200_000));
+		const merged = mergeHeaderRoutingObservation(prior, header);
+		expect(merged?.billing).toEqual(prior?.billing);
+		expect(merged?.billing.observedAt).toBe(NOW);
+		const byId = new Map(merged?.windowObservations.map(window => [window.id, window]));
+		expect(byId.get("anthropic:5h")).toMatchObject({
+			source: "usage-header",
+			observedAt: NOW + 200_000,
+			usedFraction: 0.25,
+		});
+		expect(byId.get("anthropic:7d")).toMatchObject({ source: "usage-full", observedAt: NOW, usedFraction: 0.2 });
+		// The unchanged billing still expires at the original boundary.
+		expect(currentIncludedBilling(merged!.billing, NOW + 299_999).state).toBe("disabled");
+		expect(currentIncludedBilling(merged!.billing, NOW + 300_000)).toMatchObject({
+			state: "unknown",
+			reason: "expired",
+		});
+	});
+
+	it("rejects forged, future or malformed billing timestamps", () => {
+		const disabled = { state: "disabled" as const, source: "claude-usage-spend" as const, sourceRevision: null };
+		expect(currentIncludedBilling({ ...disabled, observedAt: NOW, validUntil: NOW + 300_001 }, NOW)).toMatchObject({
+			state: "unknown",
+			reason: "invalid_observation",
+		});
+		expect(currentIncludedBilling({ ...disabled, observedAt: NOW + 1, validUntil: NOW + 300_001 }, NOW).state).toBe(
+			"unknown",
+		);
+		expect(currentIncludedBilling({ ...disabled, observedAt: Number.NaN, validUntil: Number.NaN }, NOW).state).toBe(
+			"unknown",
+		);
+		expect(
+			readRoutingObservation({
+				provider: "anthropic",
+				fetchedAt: NOW,
+				limits: [],
+				metadata: { routingObservation: { billing: { state: "disabled" } } },
+			}),
+		).toBeNull();
 	});
 });

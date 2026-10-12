@@ -4,7 +4,14 @@ import { getEnvApiKey } from "../env-api-key";
 import * as AIError from "../error";
 import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
-import { resolveUsedFraction } from "../usage";
+import {
+	mergeHeaderRoutingObservation,
+	type RoutingBinding,
+	type RoutingObservation,
+	readRoutingObservation,
+	resolveUsedFraction,
+	unknownBilling,
+} from "../usage";
 import type {
 	ClientUsageReport,
 	ClientUsageSummary,
@@ -18,6 +25,7 @@ import type {
 	UsageProvider,
 	UsageReport,
 } from "../usage";
+import { claudeOAuthBaseUrl } from "../usage/claude-api";
 import { DEFAULT_USAGE_PROVIDERS } from "../usage/registry";
 import { raceSignal } from "./abort";
 import type { SessionAffinity } from "./affinity";
@@ -38,7 +46,8 @@ import { mergeRefreshedOrganizationScope, OAUTH_REFRESH_SKEW_MS } from "./refres
 import type { OAuthRefresher } from "./refresh";
 import { USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
 import type { AuthCredentialStore } from "./store";
-import type { AuthCredential, OAuthCredential, ObservedUsageInput, UsageApi } from "./types";
+import { isStoreNamespace } from "./types";
+import type { AuthCredential, OAuthCredential, ObservedUsageInput, UsageApi, UsageCachePeekRequest } from "./types";
 import {
 	dedupeUsageReports,
 	isUsageLimitExhausted,
@@ -553,6 +562,12 @@ export class UsageService implements UsageApi {
 			for (const limit of headerLimitsById.values()) {
 				limits.push(limit);
 			}
+			// Headers replace same-id windows but never renew billing: the prior
+			// observation keeps its original full-response timestamp.
+			const routingObservation = mergeHeaderRoutingObservation(
+				readRoutingObservation(prior),
+				readRoutingObservation(report),
+			);
 			merged = {
 				...prior,
 				fetchedAt: now,
@@ -560,6 +575,7 @@ export class UsageService implements UsageApi {
 				metadata: {
 					...report.metadata,
 					...prior.metadata,
+					...(routingObservation ? { routingObservation } : {}),
 					source: prior.metadata?.source,
 					headersUpdatedAt: now,
 				},
@@ -662,6 +678,105 @@ export class UsageService implements UsageApi {
 		}
 
 		return requests;
+	}
+
+	/**
+	 * Already-loaded usage for one native Anthropic row, bound to its source and row id.
+	 * Reads only the local cache or the store's own overlay: no fetch, no token refresh,
+	 * no sibling lookup. Null for a missing hook, row, source namespace, or any
+	 * identity/endpoint mismatch.
+	 */
+	peekByCredentialId(request: UsageCachePeekRequest): Readonly<UsageReport> | null {
+		if (request.provider !== "anthropic") return null;
+		const source = this.#deps.pool.routingIdentities({ provider: "anthropic" }).source;
+		if (source.status !== "supported" || !isStoreNamespace(source.storeNamespace)) return null;
+		const entry = this.#deps.pool.entries("anthropic").find(candidate => candidate.id === request.credentialId);
+		const credential = entry?.credential;
+		if (credential?.type !== "oauth") return null;
+		// Reports polled without a resolver sit under the default-base-url key; the endpoint
+		// check below still pins whichever slot answers to the requested base URL.
+		const report = this.#deps.store.peekUsageByCredentialId
+			? this.#deps.store.peekUsageByCredentialId(request)
+			: [request.baseUrl, undefined]
+					.map(
+						baseUrl =>
+							this.#deps.cache.getStale<UsageReport | null>(
+								this.#deps.cache.reportKey(oauthUsageRequest("anthropic", credential, baseUrl)),
+							)?.value,
+					)
+					.find(candidate => readRoutingObservation(candidate) !== null);
+		const observation = readRoutingObservation(report);
+		if (!report || !observation) return null;
+		if (observation.endpoint !== null && observation.endpoint !== `${claudeOAuthBaseUrl(request.baseUrl)}/usage`) {
+			return null;
+		}
+		if (
+			observation.nativeRowId !== null &&
+			(observation.nativeRowId !== request.credentialId || observation.storeNamespace !== source.storeNamespace)
+		) {
+			return null;
+		}
+		const { accountId, orgId } = credential;
+		if (
+			(observation.accountId !== null && accountId !== undefined && observation.accountId !== accountId) ||
+			(observation.organizationId !== null && orgId !== undefined && observation.organizationId !== orgId)
+		) {
+			return null;
+		}
+		const bound: RoutingObservation = {
+			...observation,
+			storeNamespace: source.storeNamespace,
+			nativeRowId: request.credentialId,
+		};
+		return { ...report, metadata: { ...report.metadata, routingObservation: bound } };
+	}
+
+	/**
+	 * Read one exact row's billing and window evidence from a fresh full usage response.
+	 * Uses the single caller-selected credential: no sibling lookup, no cache write, no
+	 * token refresh. Only the provider parser sets the observation time (`nowMs`).
+	 */
+	async refreshRoutingObservation(args: {
+		binding: RoutingBinding;
+		credential: UsageCredential;
+		modelId: string | null;
+		baseUrl: string;
+		signal?: AbortSignal;
+		nowMs: number;
+	}): Promise<RoutingObservation | null> {
+		const providerImpl = this.providerFor("anthropic");
+		if (!providerImpl) return null;
+		const params: UsageFetchParams = {
+			provider: "anthropic",
+			credential: args.credential,
+			baseUrl: args.baseUrl,
+			signal: args.signal,
+			nowMs: args.nowMs,
+		};
+		if (providerImpl.supports && !providerImpl.supports(params)) return null;
+		let report: UsageReport | null;
+		try {
+			report = await providerImpl.fetchUsage(params, { fetch: this.fetch, logger: this.logger });
+		} catch (error) {
+			this.logger?.debug("Routing observation fetch failed", { error: String(error) });
+			return null;
+		}
+		const observation = readRoutingObservation(report);
+		if (!observation) return null;
+		const { binding } = args;
+		const mismatched =
+			(observation.accountId !== null &&
+				binding.accountId !== null &&
+				observation.accountId !== binding.accountId) ||
+			(observation.organizationId !== null &&
+				binding.organizationId !== null &&
+				observation.organizationId !== binding.organizationId);
+		return {
+			...observation,
+			storeNamespace: binding.storeNamespace,
+			nativeRowId: binding.nativeRowId,
+			billing: mismatched ? unknownBilling("identity_mismatch") : observation.billing,
+		};
 	}
 
 	/** Fetch the best available report for one stored credential. */

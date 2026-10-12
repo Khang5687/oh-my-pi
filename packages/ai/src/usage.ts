@@ -153,6 +153,162 @@ export interface UsageReport {
 	raw?: unknown;
 }
 
+/** Maximum age of an explicit billing observation before it is no longer admissible evidence. */
+export const ROUTING_BILLING_MAX_AGE_MS = 300_000;
+
+/** Why billing is not an admissible explicit state. */
+export type IncludedBillingReason =
+	| "no_evidence"
+	| "malformed"
+	| "conflict"
+	| "untrusted_source"
+	| "identity_mismatch"
+	| "invalid_observation"
+	| "expired";
+
+/** Whether extra (paid) usage is enabled, as read from one trusted full usage response. */
+export interface IncludedBillingState {
+	state: "disabled" | "enabled" | "unknown";
+	/** Injected clock value at successful body parse; null when no explicit state was ever observed. */
+	observedAt: number | null;
+	/** Always `observedAt + ROUTING_BILLING_MAX_AGE_MS` for an explicit state. */
+	validUntil: number | null;
+	source: "claude-usage-spend" | "claude-usage-legacy" | null;
+	sourceRevision: string | null;
+	reason?: IncludedBillingReason;
+}
+
+/** One quantitative window as last observed, with the source that supplied it. */
+export interface RoutingWindow {
+	id: string;
+	label: string;
+	scope: { kind: "shared" } | { kind: "model"; modelId: string } | { kind: "family"; family: string };
+	usedFraction: number | null;
+	resetAt: number | null;
+	observedAt: number | null;
+	validUntil: number | null;
+	source: "usage-full" | "usage-header" | "unknown";
+}
+
+/**
+ * Identity-bound routing evidence stored at `UsageReport.metadata.routingObservation`.
+ * `storeNamespace` and `nativeRowId` are null until a native owner binds the report to a row.
+ */
+export interface RoutingObservation {
+	storeNamespace: string | null;
+	nativeRowId: number | null;
+	accountId: string | null;
+	organizationId: string | null;
+	endpoint: string | null;
+	billing: IncludedBillingState;
+	windowObservations: RoutingWindow[];
+}
+
+/** The native row a routing observation must belong to. */
+export interface RoutingBinding {
+	storeNamespace: string;
+	nativeRowId: number;
+	accountId: string | null;
+	organizationId: string | null;
+}
+
+/** Billing with no admissible evidence. */
+export function unknownBilling(reason: IncludedBillingReason): IncludedBillingState {
+	return { state: "unknown", observedAt: null, validUntil: null, source: null, sourceRevision: null, reason };
+}
+
+function isFiniteNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+function isNullableFinite(value: unknown): value is number | null {
+	return value === null || isFiniteNumber(value);
+}
+
+function isNullableString(value: unknown): value is string | null {
+	return value === null || typeof value === "string";
+}
+
+function isRoutingWindow(value: unknown): value is RoutingWindow {
+	if (value === null || typeof value !== "object") return false;
+	const w = value as Record<string, unknown>;
+	return (
+		typeof w.id === "string" &&
+		typeof w.label === "string" &&
+		w.scope !== null &&
+		typeof w.scope === "object" &&
+		isNullableFinite(w.usedFraction) &&
+		isNullableFinite(w.resetAt) &&
+		isNullableFinite(w.observedAt) &&
+		isNullableFinite(w.validUntil) &&
+		(w.source === "usage-full" || w.source === "usage-header" || w.source === "unknown")
+	);
+}
+
+/** Read and shape-check a report's routing observation; null when absent or malformed. */
+export function readRoutingObservation(report: UsageReport | null | undefined): RoutingObservation | null {
+	const raw: unknown = report?.metadata?.routingObservation;
+	if (raw === null || typeof raw !== "object") return null;
+	const o = raw as Record<string, unknown>;
+	const b = o.billing as Record<string, unknown> | null | undefined;
+	if (b === null || typeof b !== "object") return null;
+	if (b.state !== "disabled" && b.state !== "enabled" && b.state !== "unknown") return null;
+	if (!isNullableFinite(b.observedAt) || !isNullableFinite(b.validUntil)) return null;
+	if (b.source !== null && b.source !== "claude-usage-spend" && b.source !== "claude-usage-legacy") return null;
+	if (!isNullableString(b.sourceRevision)) return null;
+	if (!Array.isArray(o.windowObservations) || !o.windowObservations.every(isRoutingWindow)) return null;
+	if (!isNullableString(o.storeNamespace) || !isNullableString(o.accountId)) return null;
+	if (!isNullableString(o.organizationId) || !isNullableString(o.endpoint)) return null;
+	if (o.nativeRowId !== null && !isFiniteNumber(o.nativeRowId)) return null;
+	return raw as RoutingObservation;
+}
+
+/**
+ * Billing as admissible at `nowMs`. An explicit state is kept only while
+ * `observedAt <= nowMs < validUntil` with the frozen 300000ms span; anything
+ * else, including the exact boundary, is unknown.
+ */
+export function currentIncludedBilling(billing: IncludedBillingState, nowMs: number): IncludedBillingState {
+	if (billing.state === "unknown") return billing;
+	const { observedAt, validUntil } = billing;
+	const unknown = (reason: IncludedBillingReason): IncludedBillingState => ({
+		...billing,
+		state: "unknown",
+		reason,
+	});
+	if (
+		!isFiniteNumber(nowMs) ||
+		!isFiniteNumber(observedAt) ||
+		!isFiniteNumber(validUntil) ||
+		billing.source === null ||
+		validUntil !== observedAt + ROUTING_BILLING_MAX_AGE_MS ||
+		observedAt > nowMs
+	) {
+		return unknown("invalid_observation");
+	}
+	return nowMs >= validUntil ? unknown("expired") : billing;
+}
+
+/**
+ * Merge a header-derived observation into the prior full-response one. Header
+ * windows replace same-id windows; billing, binding and its original
+ * timestamp always come from the prior observation, so headers never renew it.
+ */
+export function mergeHeaderRoutingObservation(
+	prior: RoutingObservation | null,
+	header: RoutingObservation | null,
+): RoutingObservation | null {
+	if (!prior) return header;
+	if (!header) return prior;
+	const replaced = new Map(header.windowObservations.map(window => [window.id, window]));
+	const windowObservations = prior.windowObservations.map(window => {
+		const next = replaced.get(window.id);
+		replaced.delete(window.id);
+		return next ?? window;
+	});
+	return { ...prior, windowObservations: [...windowObservations, ...replaced.values()] };
+}
+
 /**
  * Resolve a limit's used fraction (0..1; >1 means overage) from whichever
  * amount fields the provider populated. Precedence mirrors the usage UIs:
@@ -401,6 +557,8 @@ export interface UsageFetchParams {
 	accountKey?: string;
 	baseUrl?: string;
 	signal?: AbortSignal;
+	/** Injected clock for the observation time stamped on a parsed response. Defaults to Date.now(). */
+	nowMs?: number;
 }
 
 /** Shared runtime utilities for fetchers. */
