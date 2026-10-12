@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `omp account-routing-capabilities [--mode metadata]`, a static JSON probe of managed account-routing support that exits before network bootstrap, auth, settings or model startup
+
 ## [18.10.1] - 2026-10-12
 
 ### Added
