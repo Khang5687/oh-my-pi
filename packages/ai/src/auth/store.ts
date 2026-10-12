@@ -5,6 +5,7 @@ import type {
 	ClientUsageReport,
 	ClientUsageSummary,
 	ObservedUsageEntry,
+	RoutingObservation,
 	UsageHistoryEntry,
 	UsageHistoryQuery,
 	UsageReport,
@@ -17,6 +18,8 @@ import type {
 	RoutingSourceIdentity,
 	StoredAuthCredential,
 	StoredCredentialBlock,
+	RoutingExactUsageRequest,
+	RoutingExactUsageUnknownCode,
 	UsageCachePeekRequest,
 } from "./types";
 
@@ -222,6 +225,14 @@ export interface CredentialUpstream {
 	 * (a remote store's cache/overlay). Must not fetch, refresh or list siblings.
 	 */
 	peekUsageByCredentialId?(request: UsageCachePeekRequest): Readonly<UsageReport> | null;
+	/**
+	 * Optional hook for stores whose credentials are owned elsewhere (a broker). Asks the owner for
+	 * one exact row's observation and returns it, or the typed reason there is none. Must never
+	 * fall back to aggregate reports.
+	 */
+	refreshExactUsage?(
+		request: Omit<RoutingExactUsageRequest, "forceRefresh">,
+	): Promise<RoutingObservation | RoutingExactUsageUnknownCode>;
 	/**
 	 * Optional store hook to ingest a parsed provider usage report for one OAuth
 	 * credential. Remote broker stores use this to overlay header-derived limits

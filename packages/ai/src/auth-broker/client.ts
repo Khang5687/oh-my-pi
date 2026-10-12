@@ -8,11 +8,18 @@
 
 import { type } from "@oh-my-pi/omptype";
 import { readSseEvents } from "@oh-my-pi/pi-utils";
-import type { AuthCredential, DisabledCredentialSummary, OAuthRefreshReason } from "../auth-storage";
+import {
+	type AuthCredential,
+	type DisabledCredentialSummary,
+	type OAuthRefreshReason,
+	ROUTING_EXACT_USAGE_UNKNOWN_CODES,
+} from "../auth-storage";
 import type {
 	ClientUsageReportRequest,
 	ClientUsageReportResponse,
 	ClientUsageSummaryResponse,
+	ExactUsageRequest,
+	ExactUsageResponse,
 	CredentialBlockDeleteRequest,
 	CredentialBlockRequest,
 	CredentialBlockResponse,
@@ -49,6 +56,64 @@ import {
 	usageStaleResponseSchema,
 } from "./wire-schemas";
 
+const exactUsageIdentity = {
+	provider: "'anthropic'",
+	storeNamespace: type("string").atLeastLength(1),
+	nativeRowId: "number.integer >= 1",
+	modelId: type("string").atLeastLength(1).atMostLength(256).or("null"),
+	baseUrl: type("string").atLeastLength(1).atMostLength(2048),
+} as const;
+
+const routingWindowScopeSchema = type({ "+": "reject", kind: "'shared'" })
+	.or({ "+": "reject", kind: "'model'", modelId: "string" })
+	.or({ "+": "reject", kind: "'family'", family: "string" });
+
+const routingWindowSchema = type({
+	"+": "reject",
+	id: "string",
+	label: "string",
+	scope: routingWindowScopeSchema,
+	usedFraction: "number | null",
+	resetAt: "number | null",
+	observedAt: "number | null",
+	validUntil: "number | null",
+	source: "'usage-full' | 'usage-header' | 'unknown'",
+});
+
+const routingObservationSchema = type({
+	"+": "reject",
+	storeNamespace: "string | null",
+	nativeRowId: "number | null",
+	accountId: "string | null",
+	organizationId: "string | null",
+	endpoint: "string | null",
+	billing: {
+		"+": "reject",
+		state: "'disabled' | 'enabled' | 'unknown'",
+		observedAt: "number | null",
+		validUntil: "number | null",
+		source: "'claude-usage-spend' | 'claude-usage-legacy' | null",
+		sourceRevision: "string | null",
+		"reason?":
+			"'no_evidence' | 'malformed' | 'conflict' | 'untrusted_source' | 'identity_mismatch' | 'invalid_observation' | 'expired'",
+	},
+	windowObservations: routingWindowSchema.array(),
+});
+
+// Not in wire-schemas.ts: that module's export set is pinned by the public wire-schema contract test.
+/** `POST /v1/usage/exact` response: request identity echoed, then an observation or a typed unknown. */
+const exactUsageResponseSchema = type({
+	"+": "reject",
+	...exactUsageIdentity,
+	status: "'observed'",
+	observation: routingObservationSchema,
+}).or({
+	"+": "reject",
+	...exactUsageIdentity,
+	status: "'unknown'",
+	code: type.enumerated(...ROUTING_EXACT_USAGE_UNKNOWN_CODES),
+});
+
 /** Response schema per endpoint, keyed by the name `#request` callers pass. */
 const RESPONSE_SCHEMAS = {
 	clientUsageReportResponseSchema,
@@ -59,6 +124,7 @@ const RESPONSE_SCHEMAS = {
 	credentialRefreshResponseSchema,
 	credentialUploadResponseSchema,
 	disabledCredentialsResponseSchema,
+	exactUsageResponseSchema,
 	healthzResponseSchema,
 	usageHistoryResponseSchema,
 	usageResponseSchema,
@@ -277,6 +343,21 @@ export class AuthBrokerClient {
 		});
 	}
 
+	/**
+	 * Ask the broker owner for one selected row's billing evidence. Sends metadata identity only and
+	 * never retries: a capable broker performs at most one provider request per call. An older broker
+	 * answers 404, which surfaces as an {@link AuthBrokerError} the caller maps to "unsupported".
+	 */
+	fetchExactUsage(request: ExactUsageRequest, signal?: AbortSignal): Promise<ExactUsageResponse> {
+		return this.#request<ExactUsageResponse>("POST", "/v1/usage/exact", {
+			body: request,
+			schema: "exactUsageResponseSchema",
+			headers: { [AUTH_BROKER_CAPABILITIES_HEADER]: AUTH_BROKER_CLIENT_CAPABILITIES },
+			maxRetries: 0,
+			signal,
+		});
+	}
+
 	/** Recorded usage-limit snapshots from the broker host, oldest first. */
 	fetchUsageHistory(
 		query?: { sinceMs?: number; provider?: string },
@@ -414,6 +495,8 @@ export class AuthBrokerClient {
 			auth?: boolean;
 			body?: unknown;
 			signal?: AbortSignal;
+			headers?: Record<string, string>;
+			maxRetries?: number;
 			timeoutMs?: number;
 		},
 	): Promise<t> {
@@ -450,9 +533,11 @@ export class AuthBrokerClient {
 			body?: unknown;
 			signal?: AbortSignal;
 			headers?: Record<string, string>;
+			maxRetries?: number;
 			timeoutMs?: number;
 		},
 	): Promise<Response> {
+		const maxRetries = opts.maxRetries ?? this.#maxRetries;
 		const auth = opts.auth ?? true;
 		const url = `${this.#baseUrl}${path}`;
 		const headers: Record<string, string> = { Accept: "application/json", ...opts.headers };
@@ -470,7 +555,7 @@ export class AuthBrokerClient {
 		}
 
 		let lastError: unknown;
-		for (let attempt = 0; attempt <= this.#maxRetries; attempt += 1) {
+		for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
 			const timeoutSignal = AbortSignal.timeout(opts.timeoutMs ?? this.#timeoutMs);
 			const signal = opts.signal ? AbortSignal.any([opts.signal, timeoutSignal]) : timeoutSignal;
 			try {
@@ -507,10 +592,10 @@ export class AuthBrokerClient {
 					// HTTP errors (4xx/5xx) don't retry — caller knows what to do.
 					throw error;
 				}
-				if (attempt >= this.#maxRetries) break;
+				if (attempt >= maxRetries) break;
 			}
 		}
-		throw new AuthBrokerError(`Auth broker request failed after ${this.#maxRetries + 1} attempt(s)`, {
+		throw new AuthBrokerError(`Auth broker request failed after ${maxRetries + 1} attempt(s)`, {
 			cause: lastError,
 		});
 	}

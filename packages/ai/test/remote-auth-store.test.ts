@@ -13,7 +13,13 @@ import {
 } from "@oh-my-pi/pi-ai/auth-broker";
 import { snapshotResponseSchema } from "@oh-my-pi/pi-ai/auth-broker/wire-schemas";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
-import type { UsageLimit, UsageProvider, UsageReport } from "@oh-my-pi/pi-ai/usage";
+import {
+	currentIncludedBilling,
+	readRoutingObservation,
+	type UsageLimit,
+	type UsageProvider,
+	type UsageReport,
+} from "@oh-my-pi/pi-ai/usage";
 import * as claudeUsage from "@oh-my-pi/pi-ai/usage/claude";
 
 function requireLimit(report: UsageReport, id: string): UsageLimit {
@@ -2101,6 +2107,95 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 				"outside the configured account pool",
 			);
 			expect(remoteStore.snapshot.credentials).toEqual([]);
+		} finally {
+			remoteStore.close();
+		}
+	});
+	test("a header overlay never renews broker billing evidence or mints it where the broker sent none", async () => {
+		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
+		const remoteStore = new RemoteAuthCredentialStore({
+			client: brokerClient,
+			initialSnapshot: {
+				generation: 0,
+				generatedAt: 0,
+				serverNowMs: 0,
+				refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+				credentials: [],
+			},
+		});
+		const observedAt = 1_800_000_000_000;
+		const identity = { accountId: "account-a", email: "a@example.com" };
+		const full = claudeUsage.parseClaudeUsagePayload(
+			{
+				account_id: "account-a",
+				five_hour: { utilization: 30 },
+				seven_day: { utilization: 60 },
+				spend: { enabled: false },
+			},
+			identity,
+			"https://api.anthropic.com/api/oauth/usage",
+			observedAt,
+		);
+		if (!full) throw new Error("expected a full report");
+		const credA = {
+			type: "oauth" as const,
+			access: "ax",
+			refresh: REMOTE_REFRESH_SENTINEL,
+			expires: Date.now() + 60_000,
+			...identity,
+		};
+		const headerOverlay = claudeUsage.parseClaudeRateLimitHeaders(
+			{
+				"anthropic-ratelimit-unified-5h-utilization": "0.05",
+				"anthropic-ratelimit-unified-5h-reset": String(Math.floor((observedAt + 3_600_000) / 1000)),
+			},
+			observedAt + 200_000,
+		);
+		if (!headerOverlay) throw new Error("expected a header overlay");
+		const fetchSpy = vi
+			.spyOn(brokerClient, "fetchUsage")
+			.mockResolvedValue({ generatedAt: observedAt, reports: [full] });
+		try {
+			expect(
+				remoteStore.ingestUsageReport("anthropic", credA, {
+					...headerOverlay,
+					metadata: { ...headerOverlay.metadata, ...identity },
+				}),
+			).toBe(true);
+			const merged = await remoteStore.getUsageReport("anthropic", credA);
+			expect(fetchSpy).toHaveBeenCalledTimes(1);
+			const observation = readRoutingObservation(merged);
+			if (!observation) throw new Error("expected the broker observation to survive the overlay");
+			expect(merged!.fetchedAt).toBeGreaterThanOrEqual(observedAt + 200_000);
+			expect(observation.billing).toMatchObject({ state: "disabled", observedAt, validUntil: observedAt + 300_000 });
+			expect(currentIncludedBilling(observation.billing, observedAt + 299_999).state).toBe("disabled");
+			expect(currentIncludedBilling(observation.billing, observedAt + 300_000)).toMatchObject({
+				state: "unknown",
+				reason: "expired",
+			});
+
+			// Where the broker sent no observation, the overlay's own is header-only and carries no billing.
+			fetchSpy.mockResolvedValue({ generatedAt: observedAt, reports: [{ ...full, metadata: identity }] });
+			const bare = new RemoteAuthCredentialStore({
+				client: brokerClient,
+				initialSnapshot: {
+					generation: 0,
+					generatedAt: 0,
+					serverNowMs: 0,
+					refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+					credentials: [],
+				},
+			});
+			try {
+				bare.ingestUsageReport("anthropic", credA, {
+					...headerOverlay,
+					metadata: { ...headerOverlay.metadata, ...identity },
+				});
+				const headerOnly = readRoutingObservation(await bare.getUsageReport("anthropic", credA));
+				expect(headerOnly?.billing.state ?? "unknown").toBe("unknown");
+			} finally {
+				bare.close();
+			}
 		} finally {
 			remoteStore.close();
 		}

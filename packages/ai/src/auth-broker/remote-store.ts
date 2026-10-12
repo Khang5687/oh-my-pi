@@ -18,6 +18,8 @@ import {
 	type OAuthRefreshReason,
 	REMOTE_REFRESH_SENTINEL,
 	type RemoteOAuthCredential,
+	type RoutingExactUsageRequest,
+	type RoutingExactUsageUnknownCode,
 	type RoutingSourceIdentity,
 	ROUTING_SOURCE_UNSUPPORTED,
 	isStoreNamespace,
@@ -27,12 +29,14 @@ import {
 import * as AIError from "../error";
 import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
-import type { ClientUsageIdentity, ObservedUsageEntry, UsageReport } from "../usage";
+import type { ClientUsageIdentity, ObservedUsageEntry, RoutingObservation, UsageReport } from "../usage";
 import { raceSignal } from "../auth/abort";
 import { type AuthBrokerClient, AuthBrokerError, AuthBrokerStreamUnsupportedError } from "./client";
 import { compareCredentialBlockSnapshots } from "./protocol";
 import type {
 	CredentialBlockSnapshot,
+	ExactUsageRequest,
+	ExactUsageResponse,
 	RefresherSchedule,
 	SnapshotEntry,
 	SnapshotResponse,
@@ -1375,6 +1379,53 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		});
 		this.#usageFilterResult = { input: reports, byProvider, output };
 		return output;
+	}
+
+	/**
+	 * Exact selected-row refresh, answered by the broker that owns the credential. Sends the row's
+	 * metadata identity only, never retries, and never falls back to `/v1/usage`. The broker echoes
+	 * the identity; any difference, a namespace change mid-flight, or a missing broker endpoint
+	 * is a typed unknown, not a guess.
+	 */
+	async refreshExactUsage(
+		request: Omit<RoutingExactUsageRequest, "forceRefresh">,
+	): Promise<RoutingObservation | RoutingExactUsageUnknownCode> {
+		this.#noteActivity();
+		const { accountRef } = request;
+		const namespace = this.#snapshot.storeNamespace;
+		if (!isStoreNamespace(namespace) || namespace !== accountRef.storeNamespace) return "source_changed";
+		const identity: ExactUsageRequest = {
+			provider: request.provider,
+			storeNamespace: accountRef.storeNamespace,
+			nativeRowId: accountRef.nativeRowId,
+			modelId: request.modelId,
+			baseUrl: request.baseUrl,
+		};
+		let response: ExactUsageResponse;
+		try {
+			response = await this.#client.fetchExactUsage(identity, request.signal);
+		} catch (error) {
+			if (request.signal?.aborted) return "cancelled";
+			if (
+				error instanceof AuthBrokerError &&
+				(error.status === 404 || error.status === 405 || error.status === 501)
+			) {
+				return "unsupported";
+			}
+			logger.debug("auth-broker exact usage failed", { error: String(error) });
+			return "unavailable";
+		}
+		if (
+			response.provider !== identity.provider ||
+			response.storeNamespace !== identity.storeNamespace ||
+			response.nativeRowId !== identity.nativeRowId ||
+			response.modelId !== identity.modelId ||
+			response.baseUrl !== identity.baseUrl
+		) {
+			return "identity_mismatch";
+		}
+		if (this.#snapshot.storeNamespace !== namespace) return "source_changed";
+		return response.status === "unknown" ? response.code : response.observation;
 	}
 
 	ingestUsageReport(provider: Provider, credential: OAuthCredential, report: UsageReport): boolean {
