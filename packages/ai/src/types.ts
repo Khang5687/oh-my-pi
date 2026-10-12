@@ -1289,6 +1289,12 @@ export interface AssistantMessage {
 	 */
 	serviceTier?: ServiceTier;
 	usage: Usage;
+	/**
+	 * Visible output tokens a history rewrite (shake) has since removed from
+	 * `content`. `usage.output` still counts them, so a replay estimate subtracts
+	 * them to keep the turn's reasoning without recharging the removed text.
+	 */
+	elidedOutputTokens?: number;
 	stopReason: StopReason;
 	stopDetails?: StopDetails | null;
 	errorMessage?: string;
