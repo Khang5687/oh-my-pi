@@ -5,6 +5,7 @@
 ### Added
 
 - Added identity-bound Claude included-billing observation (`enabled`/`disabled`/`unknown`, 300000ms exact expiry) and per-window freshness under `UsageReport.metadata.routingObservation`, `UsageApi.peekByCredentialId` (no-fetch cached peek) and the optional `AuthCredentialStore.peekUsageByCredentialId` hook; header merges never renew billing evidence
+- Added pure `rankRoutingCandidates` for cache-only Claude capacity ranking of a chosen account subset, with an anchored close-choice set and typed refusals; ordinary account selection is unchanged
 - Added a persistent opaque source namespace to the SQLite credential store, the `CredentialsApi.routingIdentities()` identity-only catalog, and the optional `source-identity-v1` auth-broker capability that carries the namespace to negotiated clients; old brokers and stores without a namespace report `unsupported` and keep working unchanged
 
 ### Changed

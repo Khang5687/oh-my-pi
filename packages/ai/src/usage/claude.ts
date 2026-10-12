@@ -1092,14 +1092,23 @@ function morePressuredLimit(
 	return rankingUsedFraction(right) > rankingUsedFraction(left) ? right : left;
 }
 
+/** Most pressured weekly (7d) limit among `limits`, judged at the caller's clock. */
+export function selectClaudeSecondaryLimit(limits: readonly UsageLimit[], nowMs: number): UsageLimit | undefined {
+	return limits
+		.filter(limit => limit.scope.windowId === "7d" || limit.window?.id === "7d")
+		.reduce<UsageLimit | undefined>((selected, limit) => morePressuredLimit(selected, limit, nowMs), undefined);
+}
+
+/** Model family whose weekly row can gate `modelId`; null when only shared windows apply. */
+export function claudeRoutingModelFamily(modelId: string): string | null {
+	return getClaudeModelKind({ modelId }) ?? null;
+}
+
 function findClaudeSecondaryLimit(
 	report: UsageReport,
 	context: CredentialRankingContext | undefined,
 ): UsageLimit | undefined {
-	const nowMs = Date.now();
-	return scopeClaudeLimitsForModel(report, context)
-		.filter(limit => limit.scope.windowId === "7d" || limit.window?.id === "7d")
-		.reduce<UsageLimit | undefined>((selected, limit) => morePressuredLimit(selected, limit, nowMs), undefined);
+	return selectClaudeSecondaryLimit(scopeClaudeLimitsForModel(report, context), Date.now());
 }
 
 export const claudeRankingStrategy: CredentialRankingStrategy = {
