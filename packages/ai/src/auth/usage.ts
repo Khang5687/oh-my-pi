@@ -11,6 +11,7 @@ import {
 	type RoutingObservation,
 	readRoutingObservation,
 	resolveUsedFraction,
+	ROUTING_BILLING_MAX_AGE_MS,
 	unknownBilling,
 } from "../usage";
 import type {
@@ -35,6 +36,7 @@ import type { KeyOverrides } from "./cascade";
 import {
 	buildUsageCredential,
 	oauthUsageRequest,
+	failureCooldownMs,
 	USAGE_FAILURE_BACKOFF_MS,
 	USAGE_HEADER_INGEST_INTERVAL_MS,
 	usageCacheIdentity,
@@ -412,7 +414,7 @@ export class UsageService implements UsageApi {
 			return cached.value;
 		}
 
-		const failure = this.#deps.cache.get<null>(failureKey);
+		const failure = this.#deps.cache.get<number | null>(failureKey);
 		if (failure && failure.expiresAt > now) {
 			return this.#deps.cache.getStale<UsageReport | null>(cacheKey)?.value ?? null;
 		}
@@ -439,6 +441,7 @@ export class UsageService implements UsageApi {
 			if (report !== null) {
 				if (invalidated) return report;
 				this.#deps.blocks.reconcileRequest(request, report);
+				if (this.#deps.cache.getStale(failureKey)) this.#deps.cache.set(failureKey, { value: null, expiresAt: 0 });
 				const ttlJitter = USAGE_REPORT_TTL_MS * (Math.random() * 0.5 - 0.25);
 				// Success: stagger per-credential cache expiry so all accounts don't
 				// refresh in the same window — Anthropic / OpenAI rate-limit `/usage`
@@ -461,7 +464,9 @@ export class UsageService implements UsageApi {
 			const lastGood = retainLastGood
 				? (this.#deps.cache.getStale<UsageReport | null>(cacheKey)?.value ?? null)
 				: null;
-			const failureBackoffMs = providerImpl?.failureBackoffMs ?? USAGE_FAILURE_BACKOFF_MS;
+			const previousStreak = this.#deps.cache.getStale<number | null>(failureKey)?.value;
+			const streak = typeof previousStreak === "number" ? previousStreak : 0;
+			const failureBackoffMs = failureCooldownMs(providerImpl?.failureBackoffMs ?? USAGE_FAILURE_BACKOFF_MS, streak);
 			const backoffJitter = failureBackoffMs * (Math.random() * 0.5 - 0.25);
 			const coolDown = Date.now() + failureBackoffMs + backoffJitter;
 			// Dropping snapshots is not recovery from a failed endpoint. Persist its
@@ -469,7 +474,7 @@ export class UsageService implements UsageApi {
 			// A confirmed reset is the exception: the old failure cannot suppress
 			// the first post-reset probe.
 			if (recoveryEpoch === this.#deps.cache.recoveryEpoch(request.provider)) {
-				this.#deps.cache.set(failureKey, { value: null, expiresAt: coolDown });
+				this.#deps.cache.set(failureKey, { value: streak + 1, expiresAt: coolDown });
 			}
 			if (!invalidated) this.#deps.cache.set(cacheKey, { value: lastGood, expiresAt: coolDown });
 			return lastGood;
@@ -910,6 +915,23 @@ export class UsageService implements UsageApi {
 		}
 		// A store that owns credentials elsewhere but cannot answer exactly must not be served from sentinel rows.
 		if (store.getUsageReport || store.fetchUsageReports) return "unsupported";
+		// Every process on this machine shares one read per row and one failure cool-down. `/usage` is
+		// throttled per source IP, so per-process reads from many agents trip 429s, and re-polling
+		// during a 429 keeps it tripped. Freshness is still judged only by the billing's own observedAt.
+		const sharedKey = `routing-exact:${accountRef.storeNamespace}:${accountRef.nativeRowId}:${claudeOAuthBaseUrl(request.baseUrl)}`;
+		const failureKey = this.#deps.cache.failureKey(sharedKey);
+		if (!request.forceRefresh) {
+			const shared = this.#deps.cache.getStale<RoutingObservation>(sharedKey)?.value;
+			if (
+				shared &&
+				currentIncludedBilling(shared.billing, request.nowMs).state !== "unknown" &&
+				observationBelongsToRow(shared, accountRef, request.baseUrl, stored)
+			) {
+				return shared;
+			}
+		}
+		const failure = this.#deps.cache.getStale<{ until: number; streak: number } | null>(failureKey)?.value;
+		if (failure && request.nowMs < failure.until) return "unavailable";
 		const observation = await this.queryRoutingObservation({
 			binding: {
 				storeNamespace: accountRef.storeNamespace,
@@ -923,7 +945,25 @@ export class UsageService implements UsageApi {
 			signal,
 			nowMs: request.nowMs,
 		});
-		return observation ?? "unavailable";
+		if (signal.aborted) return "unavailable";
+		if (!observation) {
+			// ponytail: escalating cool-down stands in for retry-after, which fetchUsage does not surface.
+			const streak = failure?.streak ?? 0;
+			const backoffMs = failureCooldownMs(
+				this.providerFor("anthropic")?.failureBackoffMs ?? USAGE_FAILURE_BACKOFF_MS,
+				streak,
+			);
+			this.#deps.cache.set(failureKey, {
+				value: { until: request.nowMs + backoffMs, streak: streak + 1 },
+				expiresAt: Date.now() + backoffMs,
+			});
+			return "unavailable";
+		}
+		if (failure) this.#deps.cache.set(failureKey, { value: null, expiresAt: 0 });
+		if (observation.billing.state !== "unknown") {
+			this.#deps.cache.set(sharedKey, { value: observation, expiresAt: Date.now() + ROUTING_BILLING_MAX_AGE_MS });
+		}
+		return observation;
 	}
 
 	/**
