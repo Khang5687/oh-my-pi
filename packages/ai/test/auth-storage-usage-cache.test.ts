@@ -519,6 +519,50 @@ describe("AuthStorage usage cache: Claude rate limits", () => {
 	});
 });
 
+describe("AuthStorage usage cache: escalating failure cool-down", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("doubles the wait after each repeated 429 and starts over after a success", async () => {
+		let now = 1_800_000_000_000;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
+		const statuses = [429, 429, 429, 200, 429, 200];
+		let usageRequests = 0;
+		const usageFetch = (async (input: string | URL | Request) => {
+			const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+			if (url.search !== "") return new Response("{}", { status: 404 });
+			const status = statuses[usageRequests++];
+			if (status === 429) return Response.json({ error: { type: "rate_limit_error" } }, { status });
+			return Response.json({ five_hour: { utilization: 25, resets_at: "2099-09-23T00:00:00Z" } });
+		}) as unknown as typeof fetch;
+		const storage = new AuthStorage(makeStore([oauthRow(1, "a@example.com")]), {
+			usageFetch,
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+		});
+		const pollAfter = async (ms: number) => {
+			now += ms;
+			await storage.usage.reports();
+			return usageRequests;
+		};
+		try {
+			await storage.credentials.reload();
+			expect(await pollAfter(0)).toBe(1);
+			expect(await pollAfter(60_000)).toBe(2);
+			expect(await pollAfter(119_000)).toBe(2);
+			expect(await pollAfter(1_000)).toBe(3);
+			expect(await pollAfter(239_000)).toBe(3);
+			expect(await pollAfter(1_000)).toBe(4);
+			// After the success the next failure waits the base minute again.
+			expect(await pollAfter(5 * 60_000)).toBe(5);
+			expect(await pollAfter(60_000)).toBe(6);
+		} finally {
+			storage.close();
+		}
+	});
+});
+
 describe("AuthStorage usage cache: explicit invalidation", () => {
 	it("preserves failed-probe cooldown across repeated invalidation and storage recreation", async () => {
 		const row = oauthRow(1, "a@example.com");
@@ -1867,6 +1911,34 @@ describe("AuthStorage usage cache: routing billing observation", () => {
 			} finally {
 				first.close();
 				second.close();
+			}
+		});
+
+		it("doubles the shared cool-down on each repeated failure and clears it after a success", async () => {
+			const store = makeSource([oauthRow(1, "a@example.com")]);
+			let status = 429;
+			const base = countingFetch();
+			const storage = await open(store, (async (input: string | URL | Request, init?: RequestInit) => {
+				if (status === 200) return base.impl(input, init);
+				base.calls.push({ url: CANONICAL, bearer: "" });
+				return new Response("{}", { status });
+			}) as unknown as typeof fetch);
+			const readAt = async (nowMs: number) => {
+				await storage.usage.refreshRoutingObservation(exact({ nowMs }));
+				return base.usage().length;
+			};
+			try {
+				expect(await readAt(NOW)).toBe(1);
+				expect(await readAt(NOW + 60_000)).toBe(2);
+				expect(await readAt(NOW + 179_999)).toBe(2);
+				expect(await readAt(NOW + 180_000)).toBe(3);
+				status = 200;
+				expect(await readAt(NOW + 420_000)).toBe(4);
+				status = 429;
+				expect(await readAt(NOW + 720_000)).toBe(5);
+				expect(await readAt(NOW + 780_000)).toBe(6);
+			} finally {
+				storage.close();
 			}
 		});
 

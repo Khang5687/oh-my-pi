@@ -17,6 +17,16 @@ const USAGE_LAST_GOOD_RETENTION_MS = 24 * 60 * 60_000;
  * cooldown expires. Report invalidation does not bypass this cooldown.
  */
 export const USAGE_FAILURE_BACKOFF_MS = 10_000;
+/** Repeated failures double the cool-down up to this cap; the next success resets it. */
+const USAGE_FAILURE_BACKOFF_CAP_MS = 10 * 60_000;
+
+/**
+ * Cool-down after a probe that had already failed `streak` times in a row. A throttled
+ * endpoint is never polled at a fixed rate: each further failure waits twice as long.
+ */
+export function failureCooldownMs(baseMs: number, streak: number): number {
+	return Math.min(baseMs * 2 ** Math.min(streak, 16), Math.max(baseMs, USAGE_FAILURE_BACKOFF_CAP_MS));
+}
 /**
  * A manual invalidation persists across the next CLI process and serializes
  * same-provider probes, avoiding a cold-account burst against IP-limited
