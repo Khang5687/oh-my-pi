@@ -980,6 +980,26 @@ export class CredentialSelector {
 		return this.#syncOAuthSelectionFromStore(provider, selection, selected.id);
 	}
 
+	/**
+	 * An `includedOnly` account serves only while its included allowance is measured and left.
+	 * Past it, a provider with paid overage enabled bills instead of refusing, so a spent,
+	 * exhausted or unmeasured account is never a last resort.
+	 */
+	#includedAllowanceLeft(
+		provider: Provider,
+		usage: UsageReport | null,
+		strategy: CredentialRankingStrategy | undefined,
+		rankingContext: CredentialRankingContext | undefined,
+		options: AuthApiKeyOptions | undefined,
+	): boolean {
+		if (!usage) return false;
+		const context = rankingContext ?? { modelId: options?.modelId };
+		const resolved = strategy ?? this.#deps.strategies(provider);
+		if (resolved && isUsageLimitReached(scopedUsageLimits(resolved, usage, context))) return false;
+		const remaining = remainingUsageFraction(resolved, usage, context, Date.now());
+		return remaining !== undefined && remaining > 0;
+	}
+
 	/** Attempts to use a single OAuth credential, checking usage and refreshing token. */
 	async tryOAuth(
 		provider: Provider,
@@ -1002,8 +1022,9 @@ export class CredentialSelector {
 			blockScopes,
 			allowFallback = true,
 		} = usageOptions;
+		const includedOnly = this.#deps.policies.forCredential(provider, selection.credential)?.includedOnly === true;
 		if (
-			!allowBlocked &&
+			(!allowBlocked || includedOnly) &&
 			this.#deps.blocks.isBlocked(provider, providerKey, selection.index, blockScopes ?? blockScope)
 		) {
 			return undefined;
@@ -1024,7 +1045,7 @@ export class CredentialSelector {
 		let usage: UsageReport | null = null;
 		let usageChecked = false;
 
-		if ((checkUsage && !allowBlocked) || hasPlanRequirement) {
+		if ((checkUsage && !allowBlocked) || hasPlanRequirement || includedOnly) {
 			if (usagePrechecked) {
 				usage = prefetchedUsage;
 				usageChecked = true;
@@ -1036,6 +1057,9 @@ export class CredentialSelector {
 				usageChecked = true;
 			}
 			if (applyPlanFilter && planGate?.(usage) !== true) {
+				return undefined;
+			}
+			if (includedOnly && !this.#includedAllowanceLeft(provider, usage, strategy, rankingContext, options)) {
 				return undefined;
 			}
 			if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {
@@ -1095,7 +1119,7 @@ export class CredentialSelector {
 				const rowId = this.#deps.pool.entries(provider)[selection.index]?.id;
 				if (rowId !== undefined) this.#deps.pool.replaceById(provider, rowId, updated);
 			}
-			if ((checkUsage && !allowBlocked) || hasPlanRequirement) {
+			if ((checkUsage && !allowBlocked) || hasPlanRequirement || includedOnly) {
 				const sameAccount = selection.credential.accountId === updated.accountId;
 				if (!usageChecked || !sameAccount) {
 					usage = await this.#deps.usage.report(provider, updated, {
@@ -1105,6 +1129,9 @@ export class CredentialSelector {
 					usageChecked = true;
 				}
 				if (applyPlanFilter && planGate?.(usage) !== true) {
+					return undefined;
+				}
+				if (includedOnly && !this.#includedAllowanceLeft(provider, usage, strategy, rankingContext, options)) {
 					return undefined;
 				}
 				if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {

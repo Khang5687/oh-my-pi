@@ -95,16 +95,20 @@ export class AccountPolicies {
 			) {
 				throw new AIError.ConfigurationError(`${path}.reservePct must be a finite number between 0 and 100`);
 			}
+			if (policy.includedOnly !== undefined && typeof policy.includedOnly !== "boolean") {
+				throw new AIError.ConfigurationError(`${path}.includedOnly must be a boolean`);
+			}
 		}
 	}
 
 	validateUsageCapability(provider: string, canFetchUsage: boolean): void {
 		const policyIndex = this.#accountPolicies.findIndex(
-			policy => policy.provider === provider && policy.reservePct !== undefined,
+			policy => policy.provider === provider && (policy.reservePct !== undefined || policy.includedOnly === true),
 		);
 		if (policyIndex !== -1 && !canFetchUsage) {
+			const field = this.#accountPolicies[policyIndex]!.reservePct !== undefined ? "reservePct" : "includedOnly";
 			throw new AIError.ConfigurationError(
-				`auth.accountPolicies[${policyIndex}].reservePct requires a usage provider for ${provider}`,
+				`auth.accountPolicies[${policyIndex}].${field} requires a usage provider for ${provider}`,
 			);
 		}
 	}

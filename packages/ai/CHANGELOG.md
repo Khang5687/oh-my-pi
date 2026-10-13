@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `includedOnly` account policy (`auth.accountPolicies[].includedOnly: true`): the account serves only while its included plan allowance is measured and left, and is skipped even as a last resort once spent, exhausted, or unmeasured, so it never draws on paid overage such as Claude extra usage
+
 ### Removed
 
 - Removed the `toolNamespacesInfo` stream option; Codex requests no longer send `tool_namespaces_info` turn metadata, and `code_mode_tool_names`/`tool_namespaces_info` are no longer reserved client metadata keys.
