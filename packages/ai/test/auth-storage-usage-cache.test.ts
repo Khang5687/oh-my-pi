@@ -1772,11 +1772,11 @@ describe("AuthStorage usage cache: routing billing observation", () => {
 			return { calls, impl, usage: () => calls.filter(call => call.url === CANONICAL) };
 		}
 
-		it("reads only the selected row, binds it, and leaves the usage cache untouched", async () => {
+		it("reads only the selected row, binds it, and writes only its shared routing entry", async () => {
 			const store = makeSource([oauthRow(1, "a@example.com"), oauthRow(2, "b@example.com")]);
 			const fetcher = countingFetch();
 			const storage = await open(store, fetcher.impl);
-			const cacheBefore = store.cache.size;
+			const keysBefore = new Set(store.cache.keys());
 			try {
 				const result = await storage.usage.refreshRoutingObservation(exact());
 				expect(result).toMatchObject({
@@ -1789,7 +1789,9 @@ describe("AuthStorage usage cache: routing billing observation", () => {
 					},
 				});
 				expect(fetcher.usage().map(call => call.bearer)).toEqual(["Bearer oat-1"]);
-				expect(store.cache.size).toBe(cacheBefore);
+				expect([...store.cache.keys()].filter(key => !keysBefore.has(key))).toEqual([
+					`usage_cache:routing-exact:${NAMESPACE}:1:https://api.anthropic.com/api/oauth`,
+				]);
 			} finally {
 				storage.close();
 			}
@@ -1814,6 +1816,57 @@ describe("AuthStorage usage cache: routing billing observation", () => {
 				});
 			} finally {
 				storage.close();
+			}
+		});
+
+		it("shares one read per row across processes on the same store", async () => {
+			const store = makeSource([oauthRow(1, "a@example.com")]);
+			const fetcher = countingFetch();
+			const first = await open(store, fetcher.impl);
+			const second = await open(store, fetcher.impl);
+			try {
+				await first.usage.refreshRoutingObservation(exact());
+				const reused = await second.usage.refreshRoutingObservation(
+					exact({ modelId: "claude-sonnet-5-5", nowMs: NOW + 299_999 }),
+				);
+				expect(reused).toMatchObject({
+					kind: "observed",
+					observation: { nativeRowId: 1, billing: { state: "disabled", observedAt: NOW } },
+				});
+				expect(fetcher.usage()).toHaveLength(1);
+
+				// The shared entry never outlives its billing evidence.
+				await second.usage.refreshRoutingObservation(exact({ nowMs: NOW + 300_000 }));
+				expect(fetcher.usage()).toHaveLength(2);
+			} finally {
+				first.close();
+				second.close();
+			}
+		});
+
+		it("holds a shared cool-down after a failed read instead of re-polling a throttled endpoint", async () => {
+			const store = makeSource([oauthRow(1, "a@example.com")]);
+			const throttled = countingFetch(429);
+			const first = await open(store, throttled.impl);
+			const second = await open(store, throttled.impl);
+			try {
+				expect(await first.usage.refreshRoutingObservation(exact())).toEqual({
+					kind: "unknown",
+					accountRef: ref(1),
+					code: "unavailable",
+				});
+				expect(await second.usage.refreshRoutingObservation(exact({ nowMs: NOW + 1_000 }))).toEqual({
+					kind: "unknown",
+					accountRef: ref(1),
+					code: "unavailable",
+				});
+				expect(throttled.usage()).toHaveLength(1);
+
+				await second.usage.refreshRoutingObservation(exact({ nowMs: NOW + 60_000 }));
+				expect(throttled.usage()).toHaveLength(2);
+			} finally {
+				first.close();
+				second.close();
 			}
 		});
 

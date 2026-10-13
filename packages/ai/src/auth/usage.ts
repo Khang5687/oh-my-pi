@@ -11,6 +11,7 @@ import {
 	type RoutingObservation,
 	readRoutingObservation,
 	resolveUsedFraction,
+	ROUTING_BILLING_MAX_AGE_MS,
 	unknownBilling,
 } from "../usage";
 import type {
@@ -910,6 +911,23 @@ export class UsageService implements UsageApi {
 		}
 		// A store that owns credentials elsewhere but cannot answer exactly must not be served from sentinel rows.
 		if (store.getUsageReport || store.fetchUsageReports) return "unsupported";
+		// Every process on this machine shares one read per row and one failure cool-down. `/usage` is
+		// throttled per source IP, so per-process reads from many agents trip 429s, and re-polling
+		// during a 429 keeps it tripped. Freshness is still judged only by the billing's own observedAt.
+		const sharedKey = `routing-exact:${accountRef.storeNamespace}:${accountRef.nativeRowId}:${claudeOAuthBaseUrl(request.baseUrl)}`;
+		const failureKey = this.#deps.cache.failureKey(sharedKey);
+		if (!request.forceRefresh) {
+			const shared = this.#deps.cache.getStale<RoutingObservation>(sharedKey)?.value;
+			if (
+				shared &&
+				currentIncludedBilling(shared.billing, request.nowMs).state !== "unknown" &&
+				observationBelongsToRow(shared, accountRef, request.baseUrl, stored)
+			) {
+				return shared;
+			}
+		}
+		const coolingUntil = this.#deps.cache.getStale<number>(failureKey)?.value;
+		if (typeof coolingUntil === "number" && request.nowMs < coolingUntil) return "unavailable";
 		const observation = await this.queryRoutingObservation({
 			binding: {
 				storeNamespace: accountRef.storeNamespace,
@@ -923,7 +941,17 @@ export class UsageService implements UsageApi {
 			signal,
 			nowMs: request.nowMs,
 		});
-		return observation ?? "unavailable";
+		if (signal.aborted) return "unavailable";
+		if (!observation) {
+			// ponytail: fixed provider cool-down; honor retry-after once fetchUsage surfaces it.
+			const backoffMs = this.providerFor("anthropic")?.failureBackoffMs ?? USAGE_FAILURE_BACKOFF_MS;
+			this.#deps.cache.set(failureKey, { value: request.nowMs + backoffMs, expiresAt: Date.now() + backoffMs });
+			return "unavailable";
+		}
+		if (observation.billing.state !== "unknown") {
+			this.#deps.cache.set(sharedKey, { value: observation, expiresAt: Date.now() + ROUTING_BILLING_MAX_AGE_MS });
+		}
+		return observation;
 	}
 
 	/**
