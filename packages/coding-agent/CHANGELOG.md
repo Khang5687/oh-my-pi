@@ -6,6 +6,7 @@
 
 - Added `omp account-routing-capabilities [--mode metadata]`, a static JSON probe of managed account-routing support that exits before network bootstrap, auth, settings or model startup
 - Added host-owned Claude account routing to the RPC runtime for a process launched with `OMP_HOST_ACCOUNT_ROUTING`: `account.routing.configure`, `.refresh` and `.rank` commands, admission request/response, pause/resume and cancel frames, and a `get_state.accountRouting` projection. An ordinary launch is unchanged
+- Added an `existing` option to the RPC `login` command: `"refuse"` fails with `credential_exists` (and the stored row's id, email and organization) instead of overwriting a saved account, `{ replaceRowId }` overwrites only that row; a successful OAuth login now reports `outcome` (`added`/`replaced`), `rowId`, `email` and `orgName`, and `omp account-routing-capabilities` reports `login.existing`
 
 ### Changed
 
@@ -55,6 +56,10 @@
 - Fails unstructured task runs that conclude without a final message
 - Background task cards no longer stop updating once the agent ends its turn while the task is still running
 - Transparent images the model receives (small icons, oversized screenshots) keep their transparency instead of turning into a black square, and resized edges no longer pick up a dark fringe
+
+### Fixed
+
+- Fixed RPC login leaving the host's paste-code input dialog open after the browser callback completed the login; the host now gets a `cancel` for it
 
 ## [18.10.1] - 2026-10-12
 

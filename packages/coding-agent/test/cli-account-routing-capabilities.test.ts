@@ -59,6 +59,7 @@ function expected(mode: "model" | "metadata"): string {
 			sourceIdentity: "v1",
 			exactUsageRefresh: "v1",
 		},
+		login: { existing: true },
 		build: { version: VERSION },
 	})}\n`;
 }

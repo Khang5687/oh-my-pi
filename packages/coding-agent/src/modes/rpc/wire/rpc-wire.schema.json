@@ -662,7 +662,7 @@
 			},
 			{
 				"name": "login",
-				"doc": "Run OAuth login; the flow arrives as `open_url` and `input` UI requests.",
+				"doc": "Run OAuth login; the flow arrives as `open_url` and `input` UI requests. A refused login fails with code `credential_exists` and `data: { code, rowId, email?, orgName? }`.",
 				"params": "LoginParams",
 				"result": "LoginResult",
 				"nullable": false,
@@ -3405,6 +3405,25 @@
 				"name",
 				"available",
 				"authenticated"
+			]
+		},
+		"LoginExistingMode": {
+			"enum": [
+				"replace",
+				"refuse"
+			],
+			"type": "string"
+		},
+		"LoginReplaceRow": {
+			"type": "object",
+			"properties": {
+				"replaceRowId": {
+					"type": "integer",
+					"description": "The only stored row this login may overwrite."
+				}
+			},
+			"required": [
+				"replaceRowId"
 			]
 		},
 		"LogoutAccount": {
@@ -6579,6 +6598,17 @@
 			"properties": {
 				"providerId": {
 					"type": "string"
+				},
+				"existing": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/LoginExistingMode"
+						},
+						{
+							"$ref": "#/$defs/LoginReplaceRow"
+						}
+					],
+					"description": "What to do when the new grant matches a stored row: overwrite it (`replace`, the default), write nothing and fail with `credential_exists` (`refuse`), or overwrite only the named row."
 				}
 			},
 			"required": [
@@ -6589,6 +6619,24 @@
 			"type": "object",
 			"properties": {
 				"providerId": {
+					"type": "string"
+				},
+				"outcome": {
+					"enum": [
+						"added",
+						"replaced"
+					],
+					"type": "string",
+					"description": "Whether an OAuth login inserted a row or overwrote one."
+				},
+				"rowId": {
+					"type": "integer",
+					"description": "Store row the OAuth login wrote."
+				},
+				"email": {
+					"type": "string"
+				},
+				"orgName": {
 					"type": "string"
 				}
 			},

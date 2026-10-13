@@ -739,6 +739,13 @@ export interface LoginProvider {
 	authenticated: boolean;
 }
 
+export type LoginExistingMode = "replace" | "refuse";
+
+export interface LoginReplaceRow {
+	/** The only stored row this login may overwrite. */
+	replaceRowId: number;
+}
+
 /** A stored credential `logout` can remove; `active` marks credentials the session may be using. */
 export interface LogoutAccount {
 	credentialId: number;
@@ -1723,10 +1730,18 @@ export interface GetLoginProvidersResult {
 
 export interface LoginParams {
 	providerId: string;
+	/** What to do when the new grant matches a stored row: overwrite it (`replace`, the default), write nothing and fail with `credential_exists` (`refuse`), or overwrite only the named row. */
+	existing?: LoginExistingMode | LoginReplaceRow;
 }
 
 export interface LoginResult {
 	providerId: string;
+	/** Whether an OAuth login inserted a row or overwrote one. */
+	outcome?: "added" | "replaced";
+	/** Store row the OAuth login wrote. */
+	rowId?: number;
+	email?: string;
+	orgName?: string;
 }
 
 export interface GetLogoutAccountsParams {
