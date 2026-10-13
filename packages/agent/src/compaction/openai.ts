@@ -20,6 +20,7 @@ import { getCodexAttestationHeader } from "@oh-my-pi/pi-ai/providers/openai-code
 import { createOpenAICodexCompactionRequestContext } from "@oh-my-pi/pi-ai/providers/openai-codex-compaction";
 import { applyCodexResponsesLiteShape } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
 import { createOpenAICodexCompatibilityMetadata } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { applySessionHeader } from "@oh-my-pi/pi-ai/providers/inference-headers";
 import {
 	encodeResponsesToolResultOutput,
 	hoistInterleavedResponsesToolBatchMessages,
@@ -53,6 +54,7 @@ import {
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
 import { $env, isRecord, logger, prompt, ptree, stringifyJson, structuredCloneJSON } from "@oh-my-pi/pi-utils";
+import { dataUrlImageSize } from "../image-tokens";
 import { Tokenizer } from "../tokenizer";
 import { appendAzureApiVersion, resolveAzureOpenAiBaseUrl } from "./azure-openai-endpoint";
 import { prepareBedrockCompactionRequest } from "./bedrock";
@@ -80,7 +82,11 @@ export const REMOTE_COMPACTION_TIMEOUT_MS = 300_000;
 export const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE = prompt.render(contextWindowTruncatedOutputPrompt);
 
 const REMOTE_COMPACTION_REQUEST_OVERHEAD_TOKENS = 256;
-const REMOTE_COMPACTION_IMAGE_TOKEN_ESTIMATE = 12_000;
+/**
+ * Per-`input_image` record estimates, tagged with the pricing tokenizer's
+ * billing key; trim re-probes share untouched items by reference.
+ */
+const remoteImageTokenCache = new WeakMap<Record<string, unknown>, { billingKey: string; tokens: number }>();
 const TOOL_RESULT_IMAGE_ATTACHMENT_TEXT = "Attached image(s) from tool result:";
 
 interface NormalizedEstimateValue {
@@ -88,12 +94,16 @@ interface NormalizedEstimateValue {
 	imageTokens: number;
 }
 
-function normalizeRemoteCompactionEstimateValue(value: unknown): NormalizedEstimateValue {
+function normalizeRemoteCompactionEstimateValue(
+	value: unknown,
+	tokenizer: Tokenizer,
+	dropEncrypted = true,
+): NormalizedEstimateValue {
 	if (Array.isArray(value)) {
 		const normalized: unknown[] = [];
 		let imageTokens = 0;
 		for (const item of value) {
-			const result = normalizeRemoteCompactionEstimateValue(item);
+			const result = normalizeRemoteCompactionEstimateValue(item, tokenizer, dropEncrypted);
 			normalized.push(result.value);
 			imageTokens += result.imageTokens;
 		}
@@ -103,24 +113,43 @@ function normalizeRemoteCompactionEstimateValue(value: unknown): NormalizedEstim
 
 	const record = value as Record<string, unknown>;
 	if (record.type === "input_image") {
-		return {
-			value: { ...record, image_url: "<image>" },
-			imageTokens: REMOTE_COMPACTION_IMAGE_TOKEN_ESTIMATE,
-		};
+		let cached = remoteImageTokenCache.get(record);
+		if (cached?.billingKey !== tokenizer.frameBillingKey) {
+			const detail = record.detail;
+			cached = {
+				billingKey: tokenizer.frameBillingKey,
+				tokens: tokenizer.imageTokens(
+					typeof record.image_url === "string" ? dataUrlImageSize(record.image_url) : null,
+					detail === "low" || detail === "high" || detail === "original" || detail === "auto" ? detail : undefined,
+				),
+			};
+			remoteImageTokenCache.set(record, cached);
+		}
+		return { value: { ...record, image_url: "<image>" }, imageTokens: cached.tokens };
 	}
-
 	const normalized: Record<string, unknown> = {};
 	let imageTokens = 0;
 	for (const [key, item] of Object.entries(record)) {
 		// Opaque encrypted reasoning/compaction state: its local base64 size far
 		// exceeds what the provider bills, so it stays out of the fit estimate
 		// (same policy as `MessageCountOptions.excludeEncryptedReasoning`).
-		if (key === "encrypted_content" && typeof item === "string") continue;
-		const result = normalizeRemoteCompactionEstimateValue(item);
+		if (dropEncrypted && key === "encrypted_content" && typeof item === "string") continue;
+		const result = normalizeRemoteCompactionEstimateValue(item, tokenizer, dropEncrypted);
 		normalized[key] = result.value;
 		imageTokens += result.imageTokens;
 	}
 	return { value: normalized, imageTokens };
+}
+
+/**
+ * Tokens of stored Responses replacement history. Retained `input_image` parts
+ * count at their image estimate rather than as base64 text; everything else,
+ * opaque compaction state included, counts as serialized.
+ */
+export function countResponsesHistoryTokens(items: unknown[], tokenizer: Tokenizer): number {
+	const normalized = normalizeRemoteCompactionEstimateValue(items, tokenizer, false);
+	const serialized = stringifyJson(normalized.value);
+	return (serialized === undefined ? 0 : tokenizer.countTokens(serialized)) + normalized.imageTokens;
 }
 
 export interface TrimRemoteCompactionInputResult {
@@ -128,7 +157,11 @@ export interface TrimRemoteCompactionInputResult {
 	rewrittenOutputs: number;
 	estimatedTokensBefore: number;
 	estimatedTokensAfter: number;
-	/** Whether `input` fits the model window; false means it must not be sent. */
+	/**
+	 * Whether `input` may be sent; false means it must not be. True when the
+	 * full estimate fits, or when only the image estimate pushes it over (image
+	 * pricing is a guess; the provider's own accounting decides).
+	 */
 	fits: boolean;
 }
 
@@ -138,15 +171,17 @@ interface RemoteCompactionBudgetProbe {
 	tokens: number;
 	/** Whether the request fits the window. Always true when no window is known. */
 	fits: boolean;
+	/** Whether the request minus its image estimate fits the window. */
+	textFits: boolean;
 }
 
 /**
- * Cheap-first sizing of a remote-compaction request. Images and the request
- * frame are charged flat, so they come off the budget rather than through the
- * tokenizer; opaque `encrypted_content` payloads are excluded. The serialized
- * transcript is then probed with {@link Tokenizer.checkTokenBudget}, which only
- * pays for an exact count when the byte bound cannot already prove the request
- * fits.
+ * Cheap-first sizing of a remote-compaction request. Images (priced from their
+ * dimensions) and the request frame come off the budget rather than through
+ * the tokenizer; opaque `encrypted_content` payloads are excluded. The
+ * serialized transcript is then probed with {@link Tokenizer.checkTokenBudget},
+ * which only pays for an exact count when the byte bound cannot already prove
+ * the request fits.
  */
 function probeRemoteCompactionInputBudget(
 	input: Array<Record<string, unknown>>,
@@ -155,14 +190,22 @@ function probeRemoteCompactionInputBudget(
 	tools: unknown[] | undefined,
 	contextWindow: number | null | undefined,
 ): RemoteCompactionBudgetProbe {
-	const normalized = normalizeRemoteCompactionEstimateValue({ instructions, input, ...(tools ? { tools } : {}) });
+	const normalized = normalizeRemoteCompactionEstimateValue(
+		{ instructions, input, ...(tools ? { tools } : {}) },
+		tokenizer,
+	);
 	const serialized = stringifyJson(normalized.value) ?? "";
 	const flatTokens = normalized.imageTokens + REMOTE_COMPACTION_REQUEST_OVERHEAD_TOKENS;
 	if (!contextWindow || contextWindow <= 0) {
-		return { tokens: tokenizer.countTokens(serialized, "upperbound") + flatTokens, fits: true };
+		return { tokens: tokenizer.countTokens(serialized, "upperbound") + flatTokens, fits: true, textFits: true };
 	}
 	const budget = tokenizer.checkTokenBudget(serialized, Math.max(0, contextWindow - flatTokens));
-	return { tokens: budget.tokens + flatTokens, fits: budget.fits };
+	return {
+		tokens: budget.tokens + flatTokens,
+		fits: budget.fits,
+		// A failed check carries the exact text count (or its byte upper bound).
+		textFits: budget.fits || budget.tokens + REMOTE_COMPACTION_REQUEST_OVERHEAD_TOKENS <= contextWindow,
+	};
 }
 
 function rewriteToolOutputForContextWindow(item: Record<string, unknown>): Record<string, unknown> | undefined {
@@ -192,7 +235,9 @@ function isToolResultImageAttachment(item: Record<string, unknown>): boolean {
  * Preserve the full native transcript unless trailing tool outputs alone push a
  * remote compaction request beyond the model window. Replacing only those
  * outputs keeps call/result pairing and all earlier assistant/reasoning history,
- * matching Codex's recovery path for oversized tool turns.
+ * matching Codex's recovery path for oversized tool turns. A request whose text
+ * fits but whose image estimate does not is still sendable: refusing it on an
+ * image guess would skip native compaction the provider would have accepted.
  */
 export function trimRemoteCompactionInputToContextWindow(
 	input: Array<Record<string, unknown>>,
@@ -226,22 +271,25 @@ export function trimRemoteCompactionInputToContextWindow(
 		after = probeRemoteCompactionInputBudget(rewrittenInput, tokenizer, instructions, tools, contextWindow);
 	}
 
-	if (!rewrittenInput || !after.fits) {
+	// Rewrites that reach a full fit are kept. When they cannot, and the text
+	// already fit, the overflow is image-only: rewriting cannot shrink the image
+	// estimate, so send the untouched input rather than discard tool output.
+	if (rewrittenInput && (after.fits || (!before.textFits && after.textFits))) {
 		return {
-			input,
-			rewrittenOutputs: 0,
+			input: rewrittenInput,
+			rewrittenOutputs,
 			estimatedTokensBefore: before.tokens,
-			estimatedTokensAfter: before.tokens,
-			fits: false,
+			estimatedTokensAfter: after.tokens,
+			fits: true,
 		};
 	}
 
 	return {
-		input: rewrittenInput,
-		rewrittenOutputs,
+		input,
+		rewrittenOutputs: 0,
 		estimatedTokensBefore: before.tokens,
-		estimatedTokensAfter: after.tokens,
-		fits: true,
+		estimatedTokensAfter: before.tokens,
+		fits: before.textFits,
 	};
 }
 
@@ -827,6 +875,7 @@ export async function requestOpenAiRemoteCompaction(
 				Authorization: `Bearer ${apiKey}`,
 				...model.headers,
 			};
+	applySessionHeader(headers, model.compat, opts?.sessionId);
 
 	// Codex endpoints require additional auth headers
 	if (isCodexResponses) {

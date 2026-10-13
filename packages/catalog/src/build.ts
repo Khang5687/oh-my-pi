@@ -101,9 +101,11 @@ function applyCatalogAssignments<TApi extends Api>(model: Model<TApi>, catalog: 
 	if (serviceTierCost !== undefined) {
 		const flex = numberField(serviceTierCost, "flex");
 		const priorityTier = numberField(serviceTierCost, "priority");
+		const ultrafast = numberField(serviceTierCost, "ultrafast");
 		model.serviceTierCost = {
 			...(flex !== undefined && { flex }),
 			...(priorityTier !== undefined && { priority: priorityTier }),
+			...(ultrafast !== undefined && { ultrafast }),
 		};
 	}
 	const priority = catalog.priority;
@@ -164,8 +166,9 @@ function applyCatalogAssignments<TApi extends Api>(model: Model<TApi>, catalog: 
 
 /**
  * Applies reviewed catalog-data value corrections (`cost-patch`,
- * `cache-read-at-input-rate`, `limits-patch`, `long-context-cost`,
- * `context-window-floor`, `input-modalities`) onto an upstream-sourced spec. Applied by
+ * `cache-read-at-input-rate`, `cache-write-rate`, `limits-patch`,
+ * `long-context-cost`, `context-window-floor`, `input-modalities`) onto an
+ * upstream-sourced spec. Applied by
  * `buildModel` to every upstream-sourced spec; user-authored overrides are
  * recomposed after building by the override applicators, so explicit user
  * limits and pricing still win.
@@ -174,40 +177,6 @@ export function applyCatalogCorrections(
 	model: Pick<ModelSpec<Api>, "cost" | "contextWindow" | "maxTokens" | "input">,
 	catalog: Record<string, unknown>,
 ): void {
-	const longContext = objectPayload(catalog.longContext);
-	if (longContext !== undefined) {
-		const inputThreshold = numberField(longContext, "inputThreshold");
-		const inclusive = Reflect.get(longContext, "inputThresholdInclusive") === true;
-		const multiplier = numberField(longContext, "multiplier");
-		const input = numberField(longContext, "input");
-		const output = numberField(longContext, "output");
-		const cacheRead = numberField(longContext, "cacheRead");
-		const cacheWrite = numberField(longContext, "cacheWrite");
-		const base = model.cost;
-		const hasTokenPrice = base.input !== 0 || base.output !== 0 || base.cacheRead !== 0 || base.cacheWrite !== 0;
-		if (inputThreshold !== undefined && multiplier !== undefined && hasTokenPrice) {
-			// Multiplier form: tier rates derive from the row's live list price.
-			model.cost = {
-				...base,
-				longContext: {
-					inputThreshold,
-					...(inclusive && { inputThresholdInclusive: true }),
-					input: base.input * multiplier,
-					output: base.output * multiplier,
-					cacheRead: base.cacheRead * multiplier,
-					cacheWrite: base.cacheWrite * multiplier,
-				},
-			};
-		} else if (
-			inputThreshold !== undefined &&
-			input !== undefined &&
-			output !== undefined &&
-			cacheRead !== undefined &&
-			cacheWrite !== undefined
-		) {
-			model.cost = { ...model.cost, longContext: { inputThreshold, input, output, cacheRead, cacheWrite } };
-		}
-	}
 	const patch = objectPayload(catalog.costPatch);
 	if (patch !== undefined) {
 		model.cost = { ...model.cost };
@@ -244,12 +213,56 @@ export function applyCatalogCorrections(
 			applyEffectiveFallbackRates(model.cost, Reflect.get(fallback, "effectiveRates"));
 		}
 	}
+	const longContext = objectPayload(catalog.longContext);
+	if (longContext !== undefined) {
+		const inputThreshold = numberField(longContext, "inputThreshold");
+		const inclusive = Reflect.get(longContext, "inputThresholdInclusive") === true;
+		const multiplier = numberField(longContext, "multiplier");
+		const input = numberField(longContext, "input");
+		const output = numberField(longContext, "output");
+		const cacheRead = numberField(longContext, "cacheRead");
+		const cacheWrite = numberField(longContext, "cacheWrite");
+		const base = model.cost;
+		const hasTokenPrice = base.input !== 0 || base.output !== 0 || base.cacheRead !== 0 || base.cacheWrite !== 0;
+		if (inputThreshold !== undefined && multiplier !== undefined && hasTokenPrice) {
+			// Multiplier form: tier rates derive from the row's final base card,
+			// after `cost-patch`/`cost-fallback` corrected the live list price.
+			model.cost = {
+				...base,
+				longContext: {
+					inputThreshold,
+					...(inclusive && { inputThresholdInclusive: true }),
+					input: base.input * multiplier,
+					output: base.output * (numberField(longContext, "outputMultiplier") ?? multiplier),
+					cacheRead: base.cacheRead * multiplier,
+					cacheWrite: base.cacheWrite * multiplier,
+				},
+			};
+		} else if (
+			inputThreshold !== undefined &&
+			input !== undefined &&
+			output !== undefined &&
+			cacheRead !== undefined &&
+			cacheWrite !== undefined
+		) {
+			model.cost = { ...model.cost, longContext: { inputThreshold, input, output, cacheRead, cacheWrite } };
+		}
+	}
 	if (catalog.cacheReadAtInputRate === true) {
 		const { longContext } = model.cost;
 		model.cost = {
 			...model.cost,
 			cacheRead: model.cost.input,
 			...(longContext && { longContext: { ...longContext, cacheRead: longContext.input } }),
+		};
+	}
+	const cacheWriteRate = catalog.cacheWriteRate;
+	if (typeof cacheWriteRate === "number") {
+		const { longContext } = model.cost;
+		model.cost = {
+			...model.cost,
+			cacheWrite: model.cost.input * cacheWriteRate,
+			...(longContext && { longContext: { ...longContext, cacheWrite: longContext.input * cacheWriteRate } }),
 		};
 	}
 	if (catalog.timeBased !== undefined) {
@@ -348,8 +361,9 @@ export function buildModel<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi>
 	const model: Model<TApi> = {
 		...spec,
 		// A reviewed `thinking-upgrade-neutral` policy can repair a stale
-		// `reasoning: false` discovery default (see `resolveThinkingPolicy`);
-		// materialize the correction for transports and the picker.
+		// `reasoning: false` discovery default, and an unclassified neutral spec
+		// gets an unverified ladder (see `resolveThinkingPolicy`); materialize
+		// either for transports and the picker.
 		reasoning: spec.reasoning || policy.thinking !== undefined,
 		name: cleanModelName(spec.name),
 		identity: policy.identity,
@@ -363,7 +377,8 @@ export function buildModel<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi>
 	};
 	applyCatalogAssignments(model, policy.catalog);
 	applyCatalogCorrections(model, policy.catalog);
-	// Configured lifetimes replace catalog lifetimes rather than merging with them.
+	// Configured kinds and lifetimes replace catalog values rather than merging with them.
+	if (spec.kindConfig !== undefined) model.kind = spec.kindConfig;
 	if (spec.promptCacheConfig !== undefined) model.promptCache = { ...spec.promptCacheConfig };
 	return model;
 }

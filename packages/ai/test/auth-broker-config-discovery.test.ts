@@ -69,6 +69,7 @@ describe("resolveAuthBrokerConfig config discovery", () => {
 				provider: "anthropic",
 				account: { email: "policy@example.com" },
 				reservePct: 25,
+				includedOnly: true,
 			},
 		] satisfies AuthAccountPolicies;
 		await Bun.write(
@@ -243,6 +244,18 @@ describe("resolveAuthBrokerConfig config discovery", () => {
 					"",
 				].join("\n"),
 				error: "auth.accountPolicies[0].reservePct must be between 0 and 100",
+			},
+			{
+				yaml: [
+					"auth:",
+					"  accountPolicies:",
+					"    - provider: anthropic",
+					"      account:",
+					"        email: preferred@example.com",
+					"      includedOnly: yes please",
+					"",
+				].join("\n"),
+				error: "auth.accountPolicies[0].includedOnly must be a boolean",
 			},
 			{
 				yaml: [

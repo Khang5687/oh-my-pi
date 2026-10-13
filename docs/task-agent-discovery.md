@@ -237,6 +237,12 @@ Compaction triggers are separate from model and service-tier selection: an exact
 `compaction.threshold*` settings for that agent only; agents without an entry, including agents it
 spawns, use the main session's thresholds. See [Settings](./settings.md#context-compaction-and-memory).
 
+Request budgets follow the same exact-name pattern: a `task.agentSoftRequestBudget[agentName]` entry
+(a non-negative integer) is that agent's soft request budget, replacing both `task.softRequestBudget`
+and the bundled scout/sonic ceiling, so it can raise a budget the global setting can only lower; `0`
+disables that agent's guard, and `null` clears an entry from a lower settings layer. Agents without an
+entry keep the global setting capped by their bundled ceiling. See [task](./tools/task.md#limits--caps).
+
 Service-tier precedence is independent of model selection: an exact, case-sensitive
 `task.agentServiceTierOverrides[agentName]` entry overrides `tier.subagent`; an absent entry preserves
 the global behavior. `inherit` snapshots the parent session's live per-family tiers (including
@@ -249,6 +255,25 @@ parked agent revived after a restart keeps its per-agent tier instead of re-deri
 `tier.subagent`. The entry is looked up by task/eval dispatch only; Vibe workers launched through
 the same executor keep `tier.subagent`. Service tiers are configuration-only; agent frontmatter and
 the task/eval wire formats do not expose a tier field or automatic Fast policy.
+
+Account selection is independent of model and service-tier selection: an exact, case-sensitive
+`task.agentAccountPools[agentName]` entry maps provider ids to OAuth identity keys (the `identityKey`
+values broker [client account pools](./auth-broker-gateway.md#client-account-pools-routing-not-authorization)
+use, such as `email:<address>|org:<id>` for Anthropic; [`omp usage accounts`](./cli-reference.md)
+lists them). For each listed provider the child authenticates
+only with those accounts: ranking, the parent's copied account affinity, restored pins, fallback
+passes, credential rotation, and saved-reset restores stay inside the pool, and runtime,
+environment, and stored API keys
+are not used; a `models.yml` `apiKey` for the provider fails the request instead of sending a pooled
+token to that endpoint. When no pooled account can serve, the request fails with `No API key for
+provider: … restricted to its OAuth account pool` instead of borrowing another account; an empty
+list allows no account. Saved resets about to expire are still salvaged on every account, because
+salvage serves the account that holds the reset. Pools do not pick models, so model and retry-fallback policy still decide
+which provider the child calls. The pool covers every key lookup the agent makes, whatever provider
+session id it carries: fresh or reset sessions, advisors, title generation, skill compression, and
+subagents it spawns without their own entry (an entry of their own replaces it). Vibe workers take
+the pool from their first turn, and a parked agent revived in the same process or after a restart
+takes the live entry for its agent name. A custom SDK `getApiKey` resolver bypasses pools.
 
 Runtime output schema precedence is:
 
