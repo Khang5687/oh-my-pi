@@ -24,7 +24,7 @@ export interface ManagedRoutingCapabilitiesInput {
 	completeCoverage?: boolean;
 }
 
-/** Serialize the version-1 capability document: fixed key order, one trailing LF. */
+/** Serialize the version-1 capability document: fixed key order, one trailing LF. New keys are additive; readers ignore unknown ones. */
 export function serializeManagedRoutingCapabilities(input: ManagedRoutingCapabilitiesInput): string {
 	const metadata = input.mode === "metadata";
 	const document = {
@@ -37,6 +37,8 @@ export function serializeManagedRoutingCapabilities(input: ManagedRoutingCapabil
 			sourceIdentity: "v1",
 			exactUsageRefresh: "v1",
 		},
+		// RPC `login` accepts `existing` (refuse/replaceRowId) and reports the row it wrote.
+		login: { existing: true },
 		build: { version: input.buildVersion },
 	};
 	return `${JSON.stringify(document)}\n`;

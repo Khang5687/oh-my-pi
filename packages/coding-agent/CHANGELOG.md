@@ -6,11 +6,16 @@
 
 - Added `omp account-routing-capabilities [--mode metadata]`, a static JSON probe of managed account-routing support that exits before network bootstrap, auth, settings or model startup
 - Added host-owned Claude account routing to the RPC runtime for a process launched with `OMP_HOST_ACCOUNT_ROUTING`: `account.routing.configure`, `.refresh` and `.rank` commands, admission request/response, pause/resume and cancel frames, and a `get_state.accountRouting` projection. An ordinary launch is unchanged
+- Added an `existing` option to the RPC `login` command: `"refuse"` fails with `credential_exists` (and the stored row's id, email and organization) instead of overwriting a saved account, `{ replaceRowId }` overwrites only that row; a successful OAuth login now reports `outcome` (`added`/`replaced`), `rowId`, `email` and `orgName`, and `omp account-routing-capabilities` reports `login.existing`
 
 ### Changed
 
 - Changed host-owned Claude routing so session guards read credential metadata instead of resolving a token, and a Claude quota failure that reaches the session ends the turn without a native block, account rotation, reset redemption or model fallback; an ordinary launch is unchanged
 - Changed host-owned Claude routing so title, memory, image description and question, edit auto-repair, eval `completion()`, judgment, commit message, and speech rewrite requests go through host admission under their own purpose label instead of silently doing nothing, and `getApiKeyAndHeaders` refuses the raw-credential request by name. Host-owned launches now report complete coverage, so `account.routing.configure` succeeds and the slow-mode sibling probe is skipped
+
+### Fixed
+
+- Fixed RPC login leaving the host's paste-code input dialog open after the browser callback completed the login; the host now gets a `cancel` for it
 
 ## [18.10.1] - 2026-10-12
 

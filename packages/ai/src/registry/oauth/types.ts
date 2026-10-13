@@ -49,6 +49,8 @@ export type OAuthPrompt = {
 	allowEmpty?: boolean;
 	/** Request masked entry from interactive hosts. Hosts that cannot hide input must reject the prompt. */
 	secret?: boolean;
+	/** Aborts when the flow no longer needs the answer (e.g. the loopback callback won); hosts close the prompt. */
+	signal?: AbortSignal;
 };
 
 export type OAuthAuthInfo = {

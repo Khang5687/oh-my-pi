@@ -24,7 +24,12 @@ import type { RpcMessagesPage } from "./rpc-messages";
 import type { GoalModeState } from "../../goals/state";
 import type { RpcGoalOp, RpcGoalResult } from "./rpc-goal";
 import type { BtwHistoryRecord } from "../../session/btw-history";
-import type { ManagedDispatchStatus, ManagedOutcomeCode, RoutingRefusalCode } from "@oh-my-pi/pi-ai/auth/types";
+import type {
+	ManagedDispatchStatus,
+	ManagedOutcomeCode,
+	OAuthLoginExisting,
+	RoutingRefusalCode,
+} from "@oh-my-pi/pi-ai/auth/types";
 import type { RoutingQuotaBlock, RoutingRank } from "@oh-my-pi/pi-ai/auth/rank";
 import type { IncludedBillingState, RoutingWindow } from "@oh-my-pi/pi-ai/usage";
 
@@ -127,7 +132,16 @@ export type RpcCommand =
 
 	// Login
 	| { id?: string; type: "get_login_providers" }
-	| { id?: string; type: "login"; providerId: string }
+	| {
+			id?: string;
+			type: "login";
+			providerId: string;
+			/**
+			 * What to do when the new grant matches a stored row. Absent or `"replace"` overwrites it;
+			 * `"refuse"` writes nothing and fails with `credential_exists`; `{ replaceRowId }` overwrites only that row.
+			 */
+			existing?: OAuthLoginExisting;
+	  }
 	| { id?: string; type: "get_logout_accounts"; providerId: string }
 	| { id?: string; type: "logout"; providerId: string; credentialId: number }
 
@@ -577,7 +591,14 @@ export type RpcResponse =
 			success: true;
 			data: { providers: Array<{ id: string; name: string; available: boolean; authenticated: boolean }> };
 	  }
-	| { id?: string; type: "response"; command: "login"; success: true; data: { providerId: string } }
+	| {
+			id?: string;
+			type: "response";
+			command: "login";
+			success: true;
+			/** `outcome`, `rowId`, `email` and `orgName` are set for OAuth logins. */
+			data: { providerId: string; outcome?: "added" | "replaced"; rowId?: number; email?: string; orgName?: string };
+	  }
 	| {
 			id?: string;
 			type: "response";
@@ -603,7 +624,24 @@ export type RpcResponse =
 	  }
 
 	// Error response (any command can fail); `code` is an optional machine-readable reason.
-	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };
+	// `data` is set only for `login` failing with `credential_exists`.
+	| {
+			id?: string;
+			type: "response";
+			command: string;
+			success: false;
+			error: string;
+			code?: string;
+			data?: RpcLoginCredentialExists;
+	  };
+
+/** Stored row a guarded `login` refused to overwrite. Identity only, never tokens. */
+export interface RpcLoginCredentialExists {
+	code: "credential_exists";
+	rowId: number;
+	email?: string;
+	orgName?: string;
+}
 
 // ============================================================================
 // Side question (/btw) frames (stdout)

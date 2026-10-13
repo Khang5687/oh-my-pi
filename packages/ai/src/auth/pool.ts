@@ -1,5 +1,9 @@
 import { logger } from "@oh-my-pi/pi-utils";
-import { resolveCredentialIdentityKey, serializeCredential } from "./sqlite-credential-store";
+import {
+	matchesReplacementCredential,
+	resolveCredentialIdentityKey,
+	serializeCredential,
+} from "./sqlite-credential-store";
 import type { BlockStoreHealth } from "./blocks";
 import type { AccountPolicies } from "./policy";
 import type { AuthCredentialStore } from "./store";
@@ -656,7 +660,26 @@ export class CredentialPool implements CredentialsApi {
 		return rows;
 	}
 
-	async upsertOAuth(provider: string, credential: OAuthCredential): Promise<void> {
+	/**
+	 * Active rows that {@link upsertOAuth} would overwrite with `credential`, in
+	 * store order (the first one is the row kept). Uses the store's replacement
+	 * rule, whose exact-key branch is also this pool's dedupe key.
+	 */
+	replacementTargets(provider: string, credential: OAuthCredential): StoredAuthCredential[] {
+		return this.#store
+			.listAuthCredentials(provider)
+			.filter(entry =>
+				matchesReplacementCredential(
+					provider,
+					entry.credential,
+					resolveCredentialIdentityKey(provider, entry.credential),
+					credential,
+				),
+			);
+	}
+
+	/** Upsert one OAuth credential; returns the provider's active rows after the write. */
+	async upsertOAuth(provider: string, credential: OAuthCredential): Promise<StoredAuthCredential[]> {
 		const prospectiveCredentials = this.dedupe(provider, [
 			...this.#store.listAuthCredentials(provider).map(entry => entry.credential),
 			credential,
@@ -672,6 +695,7 @@ export class CredentialPool implements CredentialsApi {
 			stored.map(entry => ({ id: entry.id, credential: entry.credential })),
 		);
 		this.reset(provider);
+		return stored;
 	}
 
 	/**

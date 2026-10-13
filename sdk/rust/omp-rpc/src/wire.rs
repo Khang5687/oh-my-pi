@@ -3451,6 +3451,31 @@ pub struct LoginProvider {
 	pub authenticated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LoginExistingMode {
+	#[serde(rename = "replace")]
+	Replace,
+	#[serde(rename = "refuse")]
+	Refuse,
+}
+
+impl LoginExistingMode {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Replace => "replace",
+			Self::Refuse => "refuse",
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoginReplaceRow {
+	/// The only stored row this login may overwrite.
+	#[serde(rename = "replaceRowId")]
+	pub replace_row_id: i64,
+}
+
 /// A stored credential `logout` can remove; `active` marks credentials the session may be using.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogoutAccount {
@@ -5399,12 +5424,25 @@ pub struct GetLoginProvidersResult {
 pub struct LoginParams {
 	#[serde(rename = "providerId")]
 	pub provider_id: String,
+	/// What to do when the new grant matches a stored row: overwrite it (`replace`, the default), write nothing and fail with `credential_exists` (`refuse`), or overwrite only the named row.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub existing: Option<LoginExistingModeOrLoginReplaceRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoginResult {
 	#[serde(rename = "providerId")]
 	pub provider_id: String,
+	/// Whether an OAuth login inserted a row or overwrote one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outcome: Option<LoginResultOutcome>,
+	/// Store row the OAuth login wrote.
+	#[serde(rename = "rowId", default, skip_serializing_if = "Option::is_none")]
+	pub row_id: Option<i64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub email: Option<String>,
+	#[serde(rename = "orgName", default, skip_serializing_if = "Option::is_none")]
+	pub org_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5761,6 +5799,32 @@ impl HostUriResultContentType {
 			Self::TextMarkdown => "text/markdown",
 			Self::ApplicationJson => "application/json",
 			Self::TextPlain => "text/plain",
+		}
+	}
+}
+
+/// Untagged union: the first variant that decodes wins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LoginExistingModeOrLoginReplaceRow {
+	LoginExistingMode(LoginExistingMode),
+	LoginReplaceRow(LoginReplaceRow),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LoginResultOutcome {
+	#[serde(rename = "added")]
+	Added,
+	#[serde(rename = "replaced")]
+	Replaced,
+}
+
+impl LoginResultOutcome {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Added => "added",
+			Self::Replaced => "replaced",
 		}
 	}
 }
@@ -6858,11 +6922,14 @@ impl Command for GetLoginProvidersCommand {
 	}
 }
 
-/// Run OAuth login; the flow arrives as `open_url` and `input` UI requests.
+/// Run OAuth login; the flow arrives as `open_url` and `input` UI requests. A refused login fails with code `credential_exists` and `data: { code, rowId, email?, orgName? }`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoginCommand {
 	#[serde(rename = "providerId")]
 	pub provider_id: String,
+	/// What to do when the new grant matches a stored row: overwrite it (`replace`, the default), write nothing and fail with `credential_exists` (`refuse`), or overwrite only the named row.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub existing: Option<LoginExistingModeOrLoginReplaceRow>,
 }
 
 impl Command for LoginCommand {
