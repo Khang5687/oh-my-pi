@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
@@ -2517,13 +2518,24 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				if (!knownProvider) {
 					return error(id, "login", `Unknown OAuth provider: ${command.providerId}`);
 				}
+				const existing: unknown = command.existing;
+				if (
+					existing !== undefined &&
+					existing !== "replace" &&
+					existing !== "refuse" &&
+					!(isRecord(existing) && Number.isSafeInteger(existing.replaceRowId))
+				) {
+					return error(id, "login", 'existing must be "replace", "refuse" or { replaceRowId: integer }');
+				}
 				const uiCtx = new RpcExtensionUIContext(pendingExtensionRequests, output);
 				// Track whether onAuth has fired. Providers that require interactive
 				// input before a browser URL cannot be satisfied headlessly; after
 				// onAuth, prompt input is the pasted OAuth code/redirect URL path.
 				let authEmitted = false;
+				const storeProvider = knownProvider.storeCredentialsAs ?? knownProvider.id;
 				try {
-					await session.modelRegistry.authStorage.oauth.login(command.providerId, {
+					const identity = await session.modelRegistry.authStorage.oauth.login(command.providerId, {
+						existing: command.existing,
 						onAuth: info => {
 							authEmitted = true;
 							output({
@@ -2555,18 +2567,50 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 									),
 								);
 							}
-							return (await uiCtx.input(prompt.message, prompt.placeholder, { timeout: 600_000 })) ?? "";
+							// The signal closes the host's paste dialog when the loopback callback wins.
+							return (
+								(await uiCtx.input(prompt.message, prompt.placeholder, {
+									timeout: 600_000,
+									signal: prompt.signal,
+								})) ?? ""
+							);
 						},
 					});
 					// Provider-scoped online refresh so the just-persisted credential
 					// re-runs discovery instead of reusing a fresh authoritative cache
-					// row (#5780).
-					await session.modelRegistry.refreshProvider(
-						knownProvider.storeCredentialsAs ?? knownProvider.id,
-						"online",
-					);
-					return success(id, "login", { providerId: command.providerId });
+					// row (#5780). Discovery resolves its key through the account
+					// selector, not the new row, so with other accounts stored it can
+					// send or refresh one of THEIR tokens. A guarded login (`existing`
+					// set) skips it then; the next discovery picks the new row up.
+					const otherRows = session.modelRegistry.authStorage.credentials
+						.list(storeProvider)
+						.some(row => row.id !== identity?.rowId);
+					if (command.existing === undefined || !otherRows) {
+						await session.modelRegistry.refreshProvider(storeProvider, "online");
+					}
+					return success(id, "login", {
+						providerId: command.providerId,
+						...(identity?.outcome === undefined
+							? {}
+							: {
+									outcome: identity.outcome,
+									rowId: identity.rowId,
+									email: identity.email,
+									orgName: identity.orgName,
+								}),
+					});
 				} catch (err: unknown) {
+					if (err instanceof AIError.CredentialExistsError) {
+						return {
+							id,
+							type: "response",
+							command: "login",
+							success: false,
+							error: err.code,
+							code: err.code,
+							data: { code: err.code, rowId: err.rowId, email: err.email, orgName: err.orgName },
+						};
+					}
 					return error(id, "login", err instanceof Error ? err.message : String(err));
 				}
 			}

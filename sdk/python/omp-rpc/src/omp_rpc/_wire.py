@@ -141,6 +141,11 @@ _BTW_STATUS_VALUES: Final[frozenset[str]] = frozenset({"running", "complete", "c
 _decode_btw_status = cast("Decoder[BtwStatus]", literal(_BTW_STATUS_VALUES))
 
 
+LoginExistingMode: TypeAlias = Literal["replace", "refuse"]
+_LOGIN_EXISTING_MODE_VALUES: Final[frozenset[str]] = frozenset({"replace", "refuse"})
+_decode_login_existing_mode = cast("Decoder[LoginExistingMode]", literal(_LOGIN_EXISTING_MODE_VALUES))
+
+
 AutoCompactionReason: TypeAlias = Literal["threshold", "overflow", "idle", "incomplete"]
 _AUTO_COMPACTION_REASON_VALUES: Final[frozenset[str]] = frozenset({"threshold", "overflow", "idle", "incomplete"})
 _decode_auto_compaction_reason = cast("Decoder[AutoCompactionReason]", literal(_AUTO_COMPACTION_REASON_VALUES))
@@ -918,6 +923,12 @@ class LoginProvider:
     name: str
     available: bool
     authenticated: bool
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class LoginReplaceRow:
+    replace_row_id: int
+    """The only stored row this login may overwrite."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2231,6 +2242,13 @@ def parse_login_provider(value: object, path: str = "LoginProvider") -> LoginPro
     )
 
 
+def parse_login_replace_row(value: object, path: str = "LoginReplaceRow") -> LoginReplaceRow:
+    payload = expect_object(value, path)
+    return LoginReplaceRow(
+        replace_row_id=required(payload, "replaceRowId", decode_int, path),
+    )
+
+
 def parse_logout_account(value: object, path: str = "LogoutAccount") -> LogoutAccount:
     payload = expect_object(value, path)
     return LogoutAccount(
@@ -3452,10 +3470,12 @@ class WireClient:
         params: dict[str, object] = {}
         return required(expect_object(self._command("get_login_providers", params), "get_login_providers"), "providers", array(parse_login_provider), "get_login_providers")
 
-    def login(self, provider_id: str) -> str:
-        """Run OAuth login; the flow arrives as `open_url` and `input` UI requests."""
+    def login(self, provider_id: str, *, existing: LoginExistingMode | LoginReplaceRow | None = None) -> str:
+        """Run OAuth login; the flow arrives as `open_url` and `input` UI requests. A refused login fails with code `credential_exists` and `data: { code, rowId, email?, orgName? }`."""
         params: dict[str, object] = {}
         params["providerId"] = provider_id
+        if existing is not None:
+            params["existing"] = existing
         return required(expect_object(self._command("login", params, timeout=600), "login"), "providerId", decode_str, "login")
 
     def get_logout_accounts(self, provider_id: str) -> tuple[LogoutAccount, ...]:
@@ -3802,7 +3822,9 @@ __all__ = [
     "LivePhaseEvent",
     "LiveRole",
     "LiveTranscriptEvent",
+    "LoginExistingMode",
     "LoginProvider",
+    "LoginReplaceRow",
     "LogoutAccount",
     "LogoutResult",
     "MessageContent",
@@ -3979,6 +4001,7 @@ __all__ = [
     "parse_live_phase_event",
     "parse_live_transcript_event",
     "parse_login_provider",
+    "parse_login_replace_row",
     "parse_logout_account",
     "parse_logout_result",
     "parse_message_end_event",

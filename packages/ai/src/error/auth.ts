@@ -66,3 +66,23 @@ export class LoginCancelledError extends Error {
 		attach(this, create(Flag.Abort));
 	}
 }
+
+/**
+ * A login run with `existing: "refuse"` (or a `replaceRowId` naming another
+ * row) found a stored credential the new grant would overwrite. Nothing was
+ * written and the new grant was dropped. Carries identity only, never tokens.
+ */
+export class CredentialExistsError extends Error {
+	readonly code = "credential_exists";
+	readonly rowId: number;
+	readonly email: string | undefined;
+	readonly orgName: string | undefined;
+
+	constructor(rowId: number, identity: { email?: string; orgName?: string }) {
+		super(`A stored credential already holds this account (row ${rowId}); nothing was written`);
+		this.name = "CredentialExistsError";
+		this.rowId = rowId;
+		this.email = identity.email;
+		this.orgName = identity.orgName;
+	}
+}

@@ -563,7 +563,19 @@ export interface OAuthLoginIdentity {
 	accountId?: string;
 	orgId?: string;
 	orgName?: string;
+	/** Store row the OAuth login wrote. */
+	rowId?: number;
+	/** Whether the OAuth login inserted a new row or overwrote a same-identity row. */
+	outcome?: "added" | "replaced";
 }
+
+/**
+ * What an OAuth login may do to a stored row with the same identity.
+ * `"replace"` (the default) overwrites it; `"refuse"` writes nothing and throws
+ * `CredentialExistsError`; `{ replaceRowId }` overwrites only that row and
+ * refuses a match on any other.
+ */
+export type OAuthLoginExisting = "replace" | "refuse" | { replaceRowId: number };
 
 /** Failure while resolving access to one OAuth account. */
 export interface OAuthAccessFailure {
@@ -797,6 +809,7 @@ export type OAuthLoginController = OAuthController & {
 	onAuth: (info: OAuthAuthInfo) => void;
 	/** onPrompt is required for some providers (github-copilot, openai-codex) */
 	onPrompt: (prompt: OAuthPrompt) => Promise<string>;
+	existing?: OAuthLoginExisting;
 };
 
 /** Opaque identity of the authoritative credential store that owns native row ids. */

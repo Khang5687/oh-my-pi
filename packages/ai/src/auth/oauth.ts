@@ -70,6 +70,7 @@ export class OAuthAccounts implements OAuthApi {
 					untilAborted(signal, () =>
 						ctrl.onPrompt({
 							message: "Paste the authorization code (or full redirect URL):",
+							signal,
 						}),
 					)
 			: undefined;
@@ -103,16 +104,35 @@ export class OAuthAccounts implements OAuthApi {
 			...result,
 			authorizedAt: Date.now(),
 		};
+		const storeProvider = def.storeCredentialsAs ?? provider;
+		const targets = this.#deps.pool.replacementTargets(storeProvider, newCredential);
+		const existing = ctrl.existing ?? "replace";
+		// ponytail: check-then-write is not one transaction; a concurrent writer can still race (as today).
+		const conflict =
+			existing === "replace"
+				? undefined
+				: existing === "refuse"
+					? targets[0]
+					: targets.find(target => target.id !== existing.replaceRowId);
+		if (conflict) {
+			const held = conflict.credential.type === "oauth" ? conflict.credential : undefined;
+			throw new AIError.CredentialExistsError(conflict.id, { email: held?.email, orgName: held?.orgName });
+		}
 		// Use pool.upsertOAuth to upsert the new credential.
 		// Any legacy api_key rows from older versions will be cleaned up so they do not
 		// shadow the new OAuth row, while preserving other active OAuth credentials.
-		await this.#deps.pool.upsertOAuth(def.storeCredentialsAs ?? provider, newCredential);
+		const stored = await this.#deps.pool.upsertOAuth(storeProvider, newCredential);
+		const rowId = stored.find(
+			entry => entry.credential.type === "oauth" && entry.credential.access === newCredential.access,
+		)?.id;
 		return {
 			type: "oauth",
 			email: newCredential.email,
 			accountId: newCredential.accountId,
 			orgId: newCredential.orgId,
 			orgName: newCredential.orgName,
+			rowId,
+			outcome: targets.length > 0 ? "replaced" : "added",
 		};
 	}
 

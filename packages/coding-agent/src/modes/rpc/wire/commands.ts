@@ -316,9 +316,21 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	},
 	{
 		name: "login",
-		doc: "Run OAuth login; the flow arrives as `open_url` and `input` UI requests.",
-		params: { providerId: "string" },
-		result: { providerId: "string" },
+		doc: "Run OAuth login; the flow arrives as `open_url` and `input` UI requests. A refused login fails with code `credential_exists` and `data: { code, rowId, email?, orgName? }`.",
+		params: {
+			providerId: "string",
+			"existing?": doc(
+				"LoginExistingMode | LoginReplaceRow",
+				"What to do when the new grant matches a stored row: overwrite it (`replace`, the default), write nothing and fail with `credential_exists` (`refuse`), or overwrite only the named row.",
+			),
+		},
+		result: {
+			providerId: "string",
+			"outcome?": doc("'added' | 'replaced'", "Whether an OAuth login inserted a row or overwrote one."),
+			"rowId?": doc("number.integer", "Store row the OAuth login wrote."),
+			"email?": "string",
+			"orgName?": "string",
+		},
 		unwrap: "providerId",
 		timeoutMs: 600_000,
 	},

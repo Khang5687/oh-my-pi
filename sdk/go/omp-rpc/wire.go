@@ -3319,6 +3319,46 @@ func (v *LoginProvider) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+type LoginExistingMode string
+
+const (
+	LoginExistingModeReplace LoginExistingMode = "replace"
+	LoginExistingModeRefuse  LoginExistingMode = "refuse"
+)
+
+func (v *LoginExistingMode) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "LoginExistingMode")
+	if err != nil {
+		return err
+	}
+	switch value := LoginExistingMode(s); value {
+	case LoginExistingModeReplace, LoginExistingModeRefuse:
+		*v = value
+		return nil
+	}
+	return unknownValue("LoginExistingMode", s)
+}
+
+type LoginReplaceRow struct {
+	// The only stored row this login may overwrite.
+	ReplaceRowID int64 `json:"replaceRowId"`
+}
+
+func (v *LoginReplaceRow) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "LoginReplaceRow", v.decodeFrom)
+}
+
+func (v *LoginReplaceRow) decodeFrom(raw map[string]json.RawMessage) error {
+	var out LoginReplaceRow
+	d := fieldDecoder{raw: raw, owner: "LoginReplaceRow"}
+	d.required("replaceRowId", &out.ReplaceRowID)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 // A stored credential `logout` can remove; `active` marks credentials the session may be using.
 type LogoutAccount struct {
 	CredentialID int64             `json:"credentialId"`
@@ -7206,6 +7246,12 @@ func (v *GetLoginProvidersResult) decodeFrom(raw map[string]json.RawMessage) err
 
 type LoginResult struct {
 	ProviderID string `json:"providerId"`
+	// Whether an OAuth login inserted a row or overwrote one.
+	Outcome *LoginResultOutcome `json:"outcome,omitempty"`
+	// Store row the OAuth login wrote.
+	RowID   *int64  `json:"rowId,omitempty"`
+	Email   *string `json:"email,omitempty"`
+	OrgName *string `json:"orgName,omitempty"`
 }
 
 func (v *LoginResult) UnmarshalJSON(data []byte) error {
@@ -7216,11 +7262,35 @@ func (v *LoginResult) decodeFrom(raw map[string]json.RawMessage) error {
 	var out LoginResult
 	d := fieldDecoder{raw: raw, owner: "LoginResult"}
 	d.required("providerId", &out.ProviderID)
+	d.optional("outcome", &out.Outcome)
+	d.optional("rowId", &out.RowID)
+	d.optional("email", &out.Email)
+	d.optional("orgName", &out.OrgName)
 	if d.err != nil {
 		return d.err
 	}
 	*v = out
 	return nil
+}
+
+type LoginResultOutcome string
+
+const (
+	LoginResultOutcomeAdded    LoginResultOutcome = "added"
+	LoginResultOutcomeReplaced LoginResultOutcome = "replaced"
+)
+
+func (v *LoginResultOutcome) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "LoginResultOutcome")
+	if err != nil {
+		return err
+	}
+	switch value := LoginResultOutcome(s); value {
+	case LoginResultOutcomeAdded, LoginResultOutcomeReplaced:
+		*v = value
+		return nil
+	}
+	return unknownValue("LoginResultOutcome", s)
 }
 
 type GetLogoutAccountsResult struct {
@@ -7952,13 +8022,49 @@ func (c Commands) GetLoginProviders(ctx context.Context) ([]LoginProvider, error
 // LoginCommand holds the parameters of "login".
 type LoginCommand struct {
 	ProviderID string `json:"providerId"`
+	// What to do when the new grant matches a stored row: overwrite it (`replace`, the default), write nothing and fail with `credential_exists` (`refuse`), or overwrite only the named row.
+	Existing *LoginExistingModeOrLoginReplaceRow `json:"existing,omitempty"`
 }
 
-// Login sends "login": Run OAuth login; the flow arrives as `open_url` and `input` UI requests.
+// Login sends "login": Run OAuth login; the flow arrives as `open_url` and `input` UI requests. A refused login fails with code `credential_exists` and `data: { code, rowId, email?, orgName? }`.
 func (c Commands) Login(ctx context.Context, p LoginCommand) (string, error) {
 	var out LoginResult
 	err := c.call(ctx, "login", p, 600*time.Second, &out)
 	return out.ProviderID, err
+}
+
+// LoginExistingModeOrLoginReplaceRow holds exactly one of its fields, chosen by the JSON kind of the value.
+type LoginExistingModeOrLoginReplaceRow struct {
+	LoginExistingMode *LoginExistingMode
+	LoginReplaceRow   *LoginReplaceRow
+}
+
+func (v LoginExistingModeOrLoginReplaceRow) MarshalJSON() ([]byte, error) {
+	switch {
+	case v.LoginExistingMode != nil:
+		return json.Marshal(*v.LoginExistingMode)
+	case v.LoginReplaceRow != nil:
+		return json.Marshal(*v.LoginReplaceRow)
+	}
+	return nil, emptyUnion("LoginExistingModeOrLoginReplaceRow")
+}
+
+func (v *LoginExistingModeOrLoginReplaceRow) UnmarshalJSON(data []byte) error {
+	var out LoginExistingModeOrLoginReplaceRow
+	var err error
+	switch jsonKind(data) {
+	case '"':
+		err = json.Unmarshal(data, &out.LoginExistingMode)
+	case '{':
+		err = json.Unmarshal(data, &out.LoginReplaceRow)
+	default:
+		return unexpectedKind("LoginExistingModeOrLoginReplaceRow", data)
+	}
+	if err != nil {
+		return err
+	}
+	*v = out
+	return nil
 }
 
 // GetLogoutAccountsCommand holds the parameters of "get_logout_accounts".
