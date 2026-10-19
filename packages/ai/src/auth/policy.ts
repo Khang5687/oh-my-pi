@@ -108,14 +108,19 @@ export class AccountPolicies {
 					);
 				}
 			}
+			if (policy.includedOnly !== undefined && typeof policy.includedOnly !== "boolean") {
+				throw new AIError.ConfigurationError(`${path}.includedOnly must be a boolean`);
+			}
 		}
 	}
 
 	validateUsageCapability(provider: string, canFetchUsage: boolean): void {
 		if (canFetchUsage) return;
-		for (const field of ["reservePct", "reclaimAbovePct"] as const) {
+		for (const field of ["reservePct", "reclaimAbovePct", "includedOnly"] as const) {
 			const policyIndex = this.#accountPolicies.findIndex(
-				policy => policy.provider === provider && policy[field] !== undefined,
+				policy =>
+					policy.provider === provider &&
+					(field === "includedOnly" ? policy.includedOnly === true : policy[field] !== undefined),
 			);
 			if (policyIndex !== -1) {
 				throw new AIError.ConfigurationError(

@@ -129,6 +129,9 @@
 - Fixed Factory Droid Gemini requests failing with 400 "For schema with items, schema type should be ARRAY" when a tool parameter accepts a string or a list, as the default `task` tool's `model` field does ([#16249](https://github.com/can1357/oh-my-pi/pull/16249) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed `PI_REQ_DEBUG=1` request dumps writing your API key, bearer token and response cookies to disk in plain text: credential headers now read `[redacted]`, as in rejected-request dumps ([#16293](https://github.com/can1357/oh-my-pi/pull/16293) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed finalized signed reasoning disappearing from displayed thinking when no deltas streamed ([#16227](https://github.com/can1357/oh-my-pi/issues/16227))
+### Added
+
+- Added the `includedOnly` account policy (`auth.accountPolicies[].includedOnly: true`): the account serves only while its included plan allowance is measured and left, and is skipped even as a last resort once spent, exhausted, blocked, or unmeasured, so it never draws on paid overage such as Claude extra usage ([#16290](https://github.com/can1357/oh-my-pi/pull/16290) by [@Khang5687](https://github.com/Khang5687))
 
 ## [18.12.2] - 2026-10-18
 

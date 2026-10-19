@@ -64,6 +64,12 @@ export interface AuthAccountPolicy {
 	readonly reservePct?: number;
 	/** Remaining quota percentage, above the reserve, at which this account takes back lower-priority warm pins. */
 	readonly reclaimAbovePct?: number;
+	/**
+	 * Serve routed requests only from the plan's included allowance. When the allowance is spent,
+	 * a hard limit is reached, the account is blocked, or its usage cannot be measured, the account
+	 * is skipped, even as a last resort, so it never draws on paid overage such as Claude extra usage.
+	 */
+	readonly includedOnly?: boolean;
 }
 
 /** Read-only set of per-account routing policies. */

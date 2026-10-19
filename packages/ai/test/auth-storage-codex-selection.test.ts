@@ -4507,4 +4507,84 @@ describe("AuthStorage claude oauth ranking", () => {
 		clockOffset = HOUR_MS + 1;
 		expect(await storage.keys.get("anthropic", "claude-idle-tie")).toBe(first);
 	});
+
+	describe("includedOnly account policy", () => {
+		const openWithPolicy = async (emails: string[]) => {
+			if (!store) throw new Error("test setup failed");
+			const storage = new AuthStorage(store, {
+				usageProviderResolver: provider => (provider === "anthropic" ? usageProvider : undefined),
+				accountPolicies: emails.map(email => ({ provider: "anthropic", account: { email }, includedOnly: true })),
+			});
+			await storage.credentials.reload();
+			return storage;
+		};
+		const usage = (accountId: string, primary: number, secondary = 0.3) =>
+			createClaudeUsageReport({
+				accountId,
+				primary: { usedFraction: primary, resetInMs: 2 * HOUR_MS },
+				secondary: { usedFraction: secondary, resetInMs: 3 * 24 * HOUR_MS },
+			});
+
+		test("serves an includedOnly account while its allowance is left", async () => {
+			const storage = await openWithPolicy(["paid@example.com"]);
+			await storage.credentials.set("anthropic", [
+				{ type: "oauth", ...createCredential("acct-paid", "paid@example.com") },
+			]);
+			usageByAccount.set("acct-paid", usage("acct-paid", 0.4));
+
+			expect(await storage.keys.get("anthropic", "included-left")).toBe("api-acct-paid");
+		});
+
+		test("never falls back to a spent includedOnly account, even as the last account", async () => {
+			const storage = await openWithPolicy(["paid@example.com"]);
+			await storage.credentials.set("anthropic", [
+				{ type: "oauth", ...createCredential("acct-paid", "paid@example.com") },
+			]);
+			usageByAccount.set("acct-paid", usage("acct-paid", 1));
+
+			expect(await storage.keys.get("anthropic", "included-spent")).toBeUndefined();
+		});
+
+		test("skips an includedOnly account whose usage cannot be measured", async () => {
+			const storage = await openWithPolicy(["paid@example.com"]);
+			await storage.credentials.set("anthropic", [
+				{ type: "oauth", ...createCredential("acct-paid", "paid@example.com") },
+				{ type: "oauth", ...createCredential("acct-free", "free@example.com") },
+			]);
+			// The only measured sibling is spent, so without the policy the unmeasured account would win.
+			usageByAccount.set("acct-free", usage("acct-free", 1, 1));
+
+			const counts = await countApiKeySelections(storage, "anthropic", "included-unknown", 30);
+			expect(countFor(counts, "api-acct-paid")).toBe(0);
+			expect(countFor(counts, "api-acct-free")).toBe(30);
+		});
+
+		test("when every account is spent, only accounts without the policy remain a last resort", async () => {
+			const storage = await openWithPolicy(["paid@example.com"]);
+			await storage.credentials.set("anthropic", [
+				{ type: "oauth", ...createCredential("acct-paid", "paid@example.com") },
+				{ type: "oauth", ...createCredential("acct-free", "free@example.com") },
+			]);
+			usageByAccount.set("acct-paid", usage("acct-paid", 1, 1));
+			usageByAccount.set("acct-free", usage("acct-free", 1, 1));
+
+			const counts = await countApiKeySelections(storage, "anthropic", "included-all-spent", 30);
+			expect(countFor(counts, "api-acct-paid")).toBe(0);
+			expect(countFor(counts, "api-acct-free")).toBe(30);
+		});
+
+		test("exact-account access still resolves a spent includedOnly account", async () => {
+			const storage = await openWithPolicy(["paid@example.com"]);
+			await storage.credentials.set("anthropic", [
+				{ type: "oauth", ...createCredential("acct-paid", "paid@example.com") },
+			]);
+			usageByAccount.set("acct-paid", usage("acct-paid", 1, 1));
+			const [account] = storage.oauth.accounts("anthropic");
+			if (!account) throw new Error("expected a stored account");
+
+			// Saved-reset redemption and model discovery address one row directly; they send no routed request.
+			const access = await storage.oauth.accessById("anthropic", account.credentialId);
+			expect(access?.ok).toBe(true);
+		});
+	});
 });
